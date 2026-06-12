@@ -222,6 +222,34 @@ impl StableRouteRouter {
             .set(&DataKey::Pair(source, destination), &true);
     }
 
+    /// Read-only quote of fee + net for a pair without writing the
+    /// timestamp / counter. Useful as a planner-only hook.
+    pub fn quote_route(
+        env: Env,
+        source: Symbol,
+        destination: Symbol,
+        amount: i128,
+    ) -> (i128, i128) {
+        if amount <= 0 {
+            panic_with_error!(&env, RouterError::AmountMustBePositive);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Pair(source.clone(), destination.clone()))
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, RouterError::PairNotRegistered);
+        }
+        let fee_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairFeeBps(source, destination))
+            .unwrap_or(0);
+        let fee = amount.checked_mul(fee_bps as i128).map(|n| n / BPS_DENOMINATOR).unwrap_or(0);
+        (fee, amount - fee)
+    }
+
     /// Read the most recent ledger timestamp at which `compute_route_fee`
     /// touched this pair. None when never routed.
     pub fn get_pair_last_route_at(
