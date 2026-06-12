@@ -215,8 +215,10 @@ impl StableRouteRouter {
         if pending != caller {
             panic_with_error!(&env, RouterError::NotPendingAdmin);
         }
-        env.storage().persistent().set(&DataKey::Admin, &caller);
+        env.storage().persistent().set(&DataKey::Admin, &caller.clone());
         env.storage().persistent().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((symbol_short!("adm_set"),), caller);
     }
 
     /// Step 1 of admin handover. Current admin proposes a new admin;
