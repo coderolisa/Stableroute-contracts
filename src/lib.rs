@@ -19,7 +19,18 @@ pub enum DataKey {
     /// Stored as `bool` so callers can query without distinguishing
     /// "absent" from "false".
     Pair(Symbol, Symbol),
+    /// Per-pair fee in basis points (1 bps = 0.01 %). Stored as `u32`
+    /// so the on-the-wire shape is fixed; values above `MAX_FEE_BPS`
+    /// are rejected at write time.
+    PairFeeBps(Symbol, Symbol),
 }
+
+/// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
+/// further is a governance decision; raising it is append-only safe
+/// but should be deliberate.
+pub const MAX_FEE_BPS: u32 = 1_000;
+/// Basis-point denominator: 1 bps = 1/10_000.
+pub const BPS_DENOMINATOR: i128 = 10_000;
 
 /// Typed contract errors. Codes are append-only — never reuse or
 /// renumber a variant once it has shipped.
@@ -33,6 +44,12 @@ pub enum RouterError {
     NotInitialized = 2,
     /// `register_pair` was called with `source == destination`.
     SourceEqualsDestination = 3,
+    /// `set_pair_fee_bps` was called with a value above [`MAX_FEE_BPS`].
+    FeeBpsTooHigh = 4,
+    /// `compute_route_fee` was called for a pair that was never registered.
+    PairNotRegistered = 5,
+    /// `compute_route_fee` was called with a non-positive amount.
+    AmountMustBePositive = 6,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -92,6 +109,74 @@ impl StableRouteRouter {
             .persistent()
             .get(&DataKey::Pair(source, destination))
             .unwrap_or(false)
+    }
+
+    /// Set the routing fee in basis points for a registered pair.
+    ///
+    /// Admin-gated. Rejects values above [`MAX_FEE_BPS`] with
+    /// [`RouterError::FeeBpsTooHigh`]. Idempotent: setting the same
+    /// fee twice is a re-assert and harmless.
+    pub fn set_pair_fee_bps(env: Env, source: Symbol, destination: Symbol, fee_bps: u32) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
+        admin.require_auth();
+        if fee_bps > MAX_FEE_BPS {
+            panic_with_error!(&env, RouterError::FeeBpsTooHigh);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::PairFeeBps(source, destination), &fee_bps);
+    }
+
+    /// Returns the configured fee in basis points for a pair, or 0 if
+    /// no fee has been set (a registered pair with no fee is free).
+    pub fn get_pair_fee_bps(env: Env, source: Symbol, destination: Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PairFeeBps(source, destination))
+            .unwrap_or(0)
+    }
+
+    /// Compute the fee in source units for routing `amount` through the
+    /// `(source, destination)` pair.
+    ///
+    /// Rejects unregistered pairs with [`RouterError::PairNotRegistered`]
+    /// and non-positive amounts with [`RouterError::AmountMustBePositive`]
+    /// so off-chain callers always get a clear typed error instead of a
+    /// silent zero. Math is integer division (truncating toward zero),
+    /// matching every existing Stellar fee accounting precedent.
+    pub fn compute_route_fee(
+        env: Env,
+        source: Symbol,
+        destination: Symbol,
+        amount: i128,
+    ) -> i128 {
+        if amount <= 0 {
+            panic_with_error!(&env, RouterError::AmountMustBePositive);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Pair(source.clone(), destination.clone()))
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, RouterError::PairNotRegistered);
+        }
+        let fee_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairFeeBps(source, destination))
+            .unwrap_or(0);
+        // amount * fee_bps / 10_000, in i128 to avoid u32*i128 overflow on
+        // amounts near i128::MAX. fee_bps is capped at MAX_FEE_BPS so the
+        // multiplication is bounded.
+        amount
+            .checked_mul(fee_bps as i128)
+            .map(|n| n / BPS_DENOMINATOR)
+            .unwrap_or(0)
     }
 
     /// Placeholder: returns a fixed route tag for a source/destination pair.
@@ -182,5 +267,89 @@ mod test {
         let env = Env::default();
         let (client, _admin) = setup_initialized(&env);
         assert!(!client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("XLM")));
+    }
+
+    #[test]
+    fn test_get_pair_fee_bps_defaults_to_zero() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        assert_eq!(
+            client.get_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            0
+        );
+    }
+
+    #[test]
+    fn test_set_pair_fee_bps_round_trip() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &50u32);
+        assert_eq!(
+            client.get_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            50
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #4)")]
+    fn test_set_pair_fee_bps_rejects_above_max() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_fee_bps(
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &(MAX_FEE_BPS + 1),
+        );
+    }
+
+    #[test]
+    fn test_compute_route_fee_basic() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &50u32);
+        // 1_000_000 * 50 / 10_000 = 5_000
+        let fee = client.compute_route_fee(
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &1_000_000_i128,
+        );
+        assert_eq!(fee, 5_000);
+    }
+
+    #[test]
+    fn test_compute_route_fee_is_zero_when_fee_unset() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        let fee = client.compute_route_fee(
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &1_000_000_i128,
+        );
+        assert_eq!(fee, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn test_compute_route_fee_rejects_unregistered_pair() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.compute_route_fee(
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &1_000_i128,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_compute_route_fee_rejects_zero_amount() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &0i128);
     }
 }
