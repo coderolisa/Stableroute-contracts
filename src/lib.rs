@@ -344,6 +344,22 @@ impl StableRouteRouter {
         {
             panic_with_error!(&env, RouterError::PairNotRegistered);
         }
+        let min_amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairMinAmount(source.clone(), destination.clone()))
+            .unwrap_or(0);
+        if amount < min_amount {
+            panic_with_error!(&env, RouterError::AmountBelowMin);
+        }
+        let max_amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairMaxAmount(source.clone(), destination.clone()))
+            .unwrap_or(i128::MAX);
+        if amount > max_amount {
+            panic_with_error!(&env, RouterError::AmountAboveMax);
+        }
         let fee_bps: u32 = env
             .storage()
             .persistent()
