@@ -42,6 +42,8 @@ pub enum DataKey {
     FeeRecipient,
     /// Protocol-wide lifetime counter of `compute_route_fee` invocations.
     TotalRoutesAllTime,
+    /// Ledger timestamp of the most recent `compute_route_fee` for a pair.
+    PairLastRouteAt(Symbol, Symbol),
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -434,6 +436,10 @@ impl StableRouteRouter {
         env.storage()
             .persistent()
             .set(&DataKey::TotalRoutesAllTime, &total.saturating_add(1));
+        env.storage().persistent().set(
+            &DataKey::PairLastRouteAt(source.clone(), destination.clone()),
+            &env.ledger().timestamp(),
+        );
         let fee_bps: u32 = env
             .storage()
             .persistent()
