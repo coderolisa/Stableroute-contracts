@@ -215,6 +215,14 @@ impl StableRouteRouter {
     /// [`RouterError::FeeBpsTooHigh`]. Idempotent: setting the same
     /// fee twice is a re-assert and harmless.
     pub fn set_pair_fee_bps(env: Env, source: Symbol, destination: Symbol, fee_bps: u32) {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, RouterError::ContractPaused);
+        }
         let admin: Address = env
             .storage()
             .persistent()
