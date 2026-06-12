@@ -56,6 +56,8 @@ pub enum DataKey {
     TotalRoutesAllTime,
     /// Ledger timestamp of the most recent `compute_route_fee` for a pair.
     PairLastRouteAt(Symbol, Symbol),
+    /// On-chain storage schema version. Distinct from version().
+    SchemaVersion,
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -95,6 +97,8 @@ pub enum RouterError {
     AmountAboveMax = 11,
     /// Reported pair liquidity is below the requested amount.
     InsufficientLiquidity = 12,
+    /// `migrate_v1_to_v2` was called from a non-v1 schema.
+    MigrationVersionMismatch = 13,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
