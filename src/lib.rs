@@ -222,6 +222,18 @@ impl StableRouteRouter {
             .set(&DataKey::Pair(source, destination), &true);
     }
 
+    /// Read the most recent ledger timestamp at which `compute_route_fee`
+    /// touched this pair. None when never routed.
+    pub fn get_pair_last_route_at(
+        env: Env,
+        source: Symbol,
+        destination: Symbol,
+    ) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PairLastRouteAt(source, destination))
+    }
+
     /// Read the protocol-wide lifetime counter of route quotes.
     pub fn get_total_routes_all_time(env: Env) -> u64 {
         env.storage()
