@@ -179,6 +179,14 @@ impl StableRouteRouter {
     /// second call with the same pair simply re-asserts the entry and
     /// is a no-op from the caller's perspective.
     pub fn register_pair(env: Env, source: Symbol, destination: Symbol) {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, RouterError::ContractPaused);
+        }
         let admin: Address = env
             .storage()
             .persistent()
