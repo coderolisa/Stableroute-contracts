@@ -38,6 +38,8 @@ pub enum DataKey {
     /// Reported available liquidity (in source units) per pair.
     /// Updated by an off-chain oracle via the admin entrypoint.
     PairLiquidity(Symbol, Symbol),
+    /// Address that receives protocol fees on settlement.
+    FeeRecipient,
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -214,6 +216,23 @@ impl StableRouteRouter {
         env.storage()
             .persistent()
             .set(&DataKey::Pair(source, destination), &true);
+    }
+
+    /// Admin sets the address that receives protocol fees at
+    /// settlement time. The router itself never custodies funds.
+    pub fn set_fee_recipient(env: Env, recipient: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::FeeRecipient, &recipient);
+    }
+
+    /// Read the configured fee recipient, if any.
+    pub fn get_fee_recipient(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::FeeRecipient)
     }
 
     /// Read the reported liquidity for a pair (0 when absent).
