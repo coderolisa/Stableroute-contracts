@@ -90,6 +90,14 @@ impl StableRouteRouter {
         env.storage().persistent().set(&DataKey::Admin, &admin);
     }
 
+    /// Returns true iff the router is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     /// Resume after a pause. Admin-gated and idempotent.
     pub fn unpause(env: Env) {
         let admin: Address = env
