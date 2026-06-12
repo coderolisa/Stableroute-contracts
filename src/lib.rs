@@ -214,6 +214,14 @@ impl StableRouteRouter {
             .set(&DataKey::Pair(source, destination), &true);
     }
 
+    /// Read the reported liquidity for a pair (0 when absent).
+    pub fn get_pair_liquidity(env: Env, source: Symbol, destination: Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PairLiquidity(source, destination))
+            .unwrap_or(0)
+    }
+
     /// Admin sets the reported liquidity for a pair (source units).
     pub fn set_pair_liquidity(env: Env, source: Symbol, destination: Symbol, liquidity: i128) {
         let admin: Address = env
