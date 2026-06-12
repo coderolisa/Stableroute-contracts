@@ -201,6 +201,21 @@ impl StableRouteRouter {
             .set(&DataKey::Pair(source, destination), &true);
     }
 
+    /// Unregister a previously-registered pair. Admin-gated. Idempotent.
+    /// Does not touch the configured fee — that is removed only when the
+    /// admin overwrites it back to 0 (or calls a future remove_fee).
+    pub fn unregister_pair(env: Env, source: Symbol, destination: Symbol) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Pair(source, destination));
+    }
+
     /// Returns `true` iff `register_pair` has been called for this pair.
     pub fn is_pair_registered(env: Env, source: Symbol, destination: Symbol) -> bool {
         env.storage()
