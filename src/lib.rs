@@ -90,6 +90,17 @@ impl StableRouteRouter {
         env.storage().persistent().set(&DataKey::Admin, &admin);
     }
 
+    /// Resume after a pause. Admin-gated and idempotent.
+    pub fn unpause(env: Env) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::Paused, &false);
+    }
+
     /// Admin pauses the router. All state-changing entrypoints will
     /// then panic with ContractPaused.
     pub fn pause(env: Env) {
