@@ -40,6 +40,8 @@ pub enum DataKey {
     PairLiquidity(Symbol, Symbol),
     /// Address that receives protocol fees on settlement.
     FeeRecipient,
+    /// Protocol-wide lifetime counter of `compute_route_fee` invocations.
+    TotalRoutesAllTime,
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -416,6 +418,14 @@ impl StableRouteRouter {
         if amount > liquidity {
             panic_with_error!(&env, RouterError::InsufficientLiquidity);
         }
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalRoutesAllTime)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalRoutesAllTime, &total.saturating_add(1));
         let fee_bps: u32 = env
             .storage()
             .persistent()
