@@ -1,5 +1,6 @@
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Env, Symbol,
 };
 
 /// Storage keys used by the StableRoute router.
@@ -46,6 +47,53 @@ impl StableRouteRouter {
         symbol_short!("ROUTER_V1")
     }
 
+    /// Initialize the router with the operational admin.
+    ///
+    /// Requires `admin.require_auth()` and panics with
+    /// [`RouterError::AlreadyInitialized`] if the admin has already
+    /// been set. Use a redeploy or a future rotation entrypoint to
+    /// change the admin.
+    pub fn init(env: Env, admin: Address) {
+        if env.storage().persistent().has(&DataKey::Admin) {
+            panic_with_error!(&env, RouterError::AlreadyInitialized);
+        }
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+    }
+
+    /// Returns the admin set at `init`, if any.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::Admin)
+    }
+
+    /// Register `(source, destination)` as a recognised route.
+    ///
+    /// Admin-gated; rejects `source == destination`. Idempotent: a
+    /// second call with the same pair simply re-asserts the entry and
+    /// is a no-op from the caller's perspective.
+    pub fn register_pair(env: Env, source: Symbol, destination: Symbol) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
+        admin.require_auth();
+        if source == destination {
+            panic_with_error!(&env, RouterError::SourceEqualsDestination);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pair(source, destination), &true);
+    }
+
+    /// Returns `true` iff `register_pair` has been called for this pair.
+    pub fn is_pair_registered(env: Env, source: Symbol, destination: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Pair(source, destination))
+            .unwrap_or(false)
+    }
+
     /// Placeholder: returns a fixed route tag for a source/destination pair.
     /// Used by the backend to verify route integrity.
     pub fn route_tag(_env: Env, source: Symbol, destination: Symbol) -> (Symbol, Symbol) {
@@ -56,7 +104,16 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::symbol_short;
+    use soroban_sdk::{symbol_short, testutils::Address as _};
+
+    fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
+        env.mock_all_auths();
+        let contract_id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.init(&admin);
+        (client, admin)
+    }
 
     #[test]
     fn test_version() {
@@ -75,5 +132,55 @@ mod test {
         let (src, dest) = client.route_tag(&symbol_short!("USDC"), &symbol_short!("EURC"));
         assert_eq!(src, symbol_short!("USDC"));
         assert_eq!(dest, symbol_short!("EURC"));
+    }
+
+    #[test]
+    fn test_init_persists_admin() {
+        let env = Env::default();
+        let (client, admin) = setup_initialized(&env);
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1)")]
+    fn test_init_rejects_double_init() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let other = Address::generate(&env);
+        client.init(&other);
+    }
+
+    #[test]
+    fn test_register_pair_round_trip() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+        // Reverse direction is independent.
+        assert!(!client.is_pair_registered(&symbol_short!("EURC"), &symbol_short!("USDC")));
+    }
+
+    #[test]
+    fn test_register_pair_is_idempotent() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #3)")]
+    fn test_register_pair_rejects_identity() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("USDC"));
+    }
+
+    #[test]
+    fn test_is_pair_registered_defaults_to_false() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        assert!(!client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("XLM")));
     }
 }
