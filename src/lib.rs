@@ -26,6 +26,9 @@ pub enum DataKey {
     /// Pending admin proposed via `propose_admin_transfer`. Two-step
     /// handover guards against locking the contract with a bad key.
     PendingAdmin,
+    /// `true` when the router is paused. No write entrypoint accepts
+    /// calls until an unpause.
+    Paused,
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -57,6 +60,8 @@ pub enum RouterError {
     NoPendingAdminTransfer = 7,
     /// `accept_admin_transfer` was called by a non-pending address.
     NotPendingAdmin = 8,
+    /// A state-changing entrypoint was called while paused.
+    ContractPaused = 9,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
