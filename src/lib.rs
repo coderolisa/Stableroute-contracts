@@ -29,6 +29,12 @@ pub enum DataKey {
     /// `true` when the router is paused. No write entrypoint accepts
     /// calls until an unpause.
     Paused,
+    /// Minimum routable amount per pair (in source units). Compute
+    /// rejects amounts below the floor.
+    PairMinAmount(Symbol, Symbol),
+    /// Maximum routable amount per pair (in source units). Compute
+    /// rejects amounts above the ceiling.
+    PairMaxAmount(Symbol, Symbol),
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -62,6 +68,10 @@ pub enum RouterError {
     NotPendingAdmin = 8,
     /// A state-changing entrypoint was called while paused.
     ContractPaused = 9,
+    /// Amount is below the configured PairMinAmount.
+    AmountBelowMin = 10,
+    /// Amount is above the configured PairMaxAmount.
+    AmountAboveMax = 11,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
