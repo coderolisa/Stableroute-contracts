@@ -234,6 +234,16 @@ impl StableRouteRouter {
             .set(&DataKey::Pair(source, destination), &true);
     }
 
+    /// Returns true iff the pair is registered AND has non-zero
+    /// reported liquidity. Useful as a quick is-routable check.
+    pub fn is_pair_active(env: Env, source: Symbol, destination: Symbol) -> bool {
+        let s = env.storage().persistent();
+        if !s.get::<_, bool>(&DataKey::Pair(source.clone(), destination.clone())).unwrap_or(false) {
+            return false;
+        }
+        s.get::<_, i128>(&DataKey::PairLiquidity(source, destination)).unwrap_or(0) > 0
+    }
+
     /// Single round-trip aggregate read for the dashboard. Returns
     /// every per-pair slot in one shot.
     pub fn get_pair_info(env: Env, source: Symbol, destination: Symbol) -> PairInfo {
