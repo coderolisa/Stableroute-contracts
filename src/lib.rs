@@ -1,4 +1,38 @@
-use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Env, Symbol,
+};
+
+/// Storage keys used by the StableRoute router.
+///
+/// Persistent storage is used for the admin address and per-pair
+/// configuration; these values change rarely (governance flow) and need
+/// to survive the contract's instance TTL window. Instance storage is
+/// reserved for hot configuration that we expect every invocation to
+/// touch — none yet.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    /// Operational admin set once at `init`.
+    Admin,
+    /// `true` if the (source, destination) pair is a recognised route.
+    /// Stored as `bool` so callers can query without distinguishing
+    /// "absent" from "false".
+    Pair(Symbol, Symbol),
+}
+
+/// Typed contract errors. Codes are append-only — never reuse or
+/// renumber a variant once it has shipped.
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RouterError {
+    /// `init` was called but the admin address is already stored.
+    AlreadyInitialized = 1,
+    /// A read or write expected the admin to be set but it was not.
+    NotInitialized = 2,
+    /// `register_pair` was called with `source == destination`.
+    SourceEqualsDestination = 3,
+}
 
 /// StableRoute router contract — placeholder for routing logic.
 /// In production this would integrate with path payments and liquidity data.
