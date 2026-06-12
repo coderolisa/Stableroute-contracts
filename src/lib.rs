@@ -23,6 +23,9 @@ pub enum DataKey {
     /// so the on-the-wire shape is fixed; values above `MAX_FEE_BPS`
     /// are rejected at write time.
     PairFeeBps(Symbol, Symbol),
+    /// Pending admin proposed via `propose_admin_transfer`. Two-step
+    /// handover guards against locking the contract with a bad key.
+    PendingAdmin,
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -50,6 +53,10 @@ pub enum RouterError {
     PairNotRegistered = 5,
     /// `compute_route_fee` was called with a non-positive amount.
     AmountMustBePositive = 6,
+    /// `accept_admin_transfer` was called with no pending admin.
+    NoPendingAdminTransfer = 7,
+    /// `accept_admin_transfer` was called by a non-pending address.
+    NotPendingAdmin = 8,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
