@@ -90,6 +90,18 @@ impl StableRouteRouter {
         env.storage().persistent().set(&DataKey::Admin, &admin);
     }
 
+    /// Admin pauses the router. All state-changing entrypoints will
+    /// then panic with ContractPaused.
+    pub fn pause(env: Env) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::Paused, &true);
+    }
+
     /// Cancel a pending handover. No-op if none is pending.
     pub fn cancel_admin_transfer(env: Env) {
         let admin: Address = env
