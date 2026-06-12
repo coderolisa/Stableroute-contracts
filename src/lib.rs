@@ -211,6 +211,14 @@ impl StableRouteRouter {
             .set(&DataKey::Pair(source, destination), &true);
     }
 
+    /// Read the per-pair maximum (i128::MAX when absent).
+    pub fn get_pair_max_amount(env: Env, source: Symbol, destination: Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PairMaxAmount(source, destination))
+            .unwrap_or(i128::MAX)
+    }
+
     /// Admin sets the per-pair maximum routable amount.
     pub fn set_pair_max_amount(env: Env, source: Symbol, destination: Symbol, max_amount: i128) {
         let admin: Address = env
