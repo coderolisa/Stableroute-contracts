@@ -110,7 +110,31 @@ pub struct StableRouteRouter;
 impl StableRouteRouter {
     /// Returns the router contract version.
     pub fn version(_env: Env) -> Symbol {
-        symbol_short!("ROUTER_V1")
+        symbol_short!("ROUTER_V2")
+    }
+
+    /// Read the persisted schema version, or 1 if absent (the implicit
+    /// pre-migration default).
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage().persistent().get(&DataKey::SchemaVersion).unwrap_or(1)
+    }
+
+    /// Migrate the schema from v1 to v2. Admin-gated; panics with
+    /// MigrationVersionMismatch on a non-v1 starting state. v2 readers
+    /// default sensibly when their new slots are absent, so the body
+    /// only stamps the new SchemaVersion.
+    pub fn migrate_v1_to_v2(env: Env) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
+        admin.require_auth();
+        let current: u32 = env.storage().persistent().get(&DataKey::SchemaVersion).unwrap_or(1);
+        if current != 1 {
+            panic_with_error!(&env, RouterError::MigrationVersionMismatch);
+        }
+        env.storage().persistent().set(&DataKey::SchemaVersion, &2u32);
     }
 
     /// Initialize the router with the operational admin.
