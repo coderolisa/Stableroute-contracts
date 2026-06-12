@@ -447,7 +447,9 @@ impl StableRouteRouter {
         admin.require_auth();
         env.storage()
             .persistent()
-            .remove(&DataKey::Pair(source, destination));
+            .remove(&DataKey::Pair(source.clone(), destination.clone()));
+        env.events()
+            .publish((symbol_short!("unreg"),), (source, destination));
     }
 
     /// Returns `true` iff `register_pair` has been called for this pair.
