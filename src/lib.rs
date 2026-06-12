@@ -85,6 +85,22 @@ impl StableRouteRouter {
         env.storage().persistent().set(&DataKey::Admin, &admin);
     }
 
+    /// Cancel a pending handover. No-op if none is pending.
+    pub fn cancel_admin_transfer(env: Env) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
+        admin.require_auth();
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+    }
+
+    /// Read the pending admin if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::PendingAdmin)
+    }
+
     /// Step 2 of admin handover. The pending admin claims the role
     /// from their own key. Panics with NoPendingAdminTransfer if none
     /// is pending or NotPendingAdmin if the caller does not match.
