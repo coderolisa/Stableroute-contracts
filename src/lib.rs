@@ -85,6 +85,23 @@ impl StableRouteRouter {
         env.storage().persistent().set(&DataKey::Admin, &admin);
     }
 
+    /// Step 2 of admin handover. The pending admin claims the role
+    /// from their own key. Panics with NoPendingAdminTransfer if none
+    /// is pending or NotPendingAdmin if the caller does not match.
+    pub fn accept_admin_transfer(env: Env, caller: Address) {
+        caller.require_auth();
+        let pending: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NoPendingAdminTransfer));
+        if pending != caller {
+            panic_with_error!(&env, RouterError::NotPendingAdmin);
+        }
+        env.storage().persistent().set(&DataKey::Admin, &caller);
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+    }
+
     /// Step 1 of admin handover. Current admin proposes a new admin;
     /// the new admin must then accept via `accept_admin_transfer`.
     pub fn propose_admin_transfer(env: Env, new_admin: Address) {
