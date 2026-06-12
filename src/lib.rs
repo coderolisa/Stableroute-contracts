@@ -230,7 +230,9 @@ impl StableRouteRouter {
         admin.require_auth();
         env.storage()
             .persistent()
-            .set(&DataKey::PendingAdmin, &new_admin);
+            .set(&DataKey::PendingAdmin, &new_admin.clone());
+        env.events()
+            .publish((symbol_short!("adm_prop"),), new_admin);
     }
 
     /// Returns the admin set at `init`, if any.
