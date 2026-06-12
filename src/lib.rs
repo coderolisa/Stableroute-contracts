@@ -170,6 +170,7 @@ impl StableRouteRouter {
             .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Paused, &false);
+        env.events().publish((symbol_short!("paused"),), false);
     }
 
     /// Admin pauses the router. All state-changing entrypoints will
@@ -182,6 +183,7 @@ impl StableRouteRouter {
             .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("paused"),), true);
     }
 
     /// Cancel a pending handover. No-op if none is pending.
