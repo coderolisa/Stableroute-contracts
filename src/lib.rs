@@ -149,6 +149,8 @@ impl StableRouteRouter {
         }
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.events()
+            .publish((symbol_short!("init"),), admin);
     }
 
     /// Returns true iff the router is currently paused.
