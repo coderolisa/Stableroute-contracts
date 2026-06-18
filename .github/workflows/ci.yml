@@ -15,7 +15,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
@@ -26,5 +26,20 @@ jobs:
       - name: Build
         run: cargo build
 
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Run tests
         run: cargo test
+
+      - name: Install WASM target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Build deployable WASM artifact
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Install coverage tool
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Check coverage
+        run: cargo llvm-cov --all-targets --fail-under-lines 95

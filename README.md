@@ -20,12 +20,17 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 2. Install Rust (if needed):
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   rustup component add rustfmt
+   rustup component add rustfmt clippy
+   rustup target add wasm32-unknown-unknown
+   cargo install cargo-llvm-cov
    ```
 3. Build and test:
    ```bash
    cargo build
+   cargo clippy --all-targets -- -D warnings
    cargo test
+   cargo build --target wasm32-unknown-unknown --release
+   cargo llvm-cov --all-targets --fail-under-lines 95
    ```
 4. Check formatting:
    ```bash
@@ -38,6 +43,9 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 |--------|-------------|
 | `cargo build` | Build the contracts |
 | `cargo test` | Run unit tests |
+| `cargo clippy --all-targets -- -D warnings` | Treat Rust lints and warnings as CI failures |
+| `cargo build --target wasm32-unknown-unknown --release` | Build the deployable Soroban WASM artifact |
+| `cargo llvm-cov --all-targets --fail-under-lines 95` | Report coverage and fail below 95 percent line coverage |
 | `cargo fmt --all` | Format code |
 | `cargo fmt --all -- --check` | CI: verify formatting |
 
@@ -47,14 +55,17 @@ On every push/PR to `main`, GitHub Actions runs:
 
 - `cargo fmt --all -- --check`
 - `cargo build`
+- `cargo clippy --all-targets -- -D warnings`
 - `cargo test`
+- `cargo build --target wasm32-unknown-unknown --release`
+- `cargo llvm-cov --all-targets --fail-under-lines 95`
 
 Ensure these pass locally before pushing.
 
 ## Contributing
 
 1. Fork the repo and create a branch from `main`.
-2. Make changes; keep tests and `cargo fmt` passing.
+2. Make changes; keep formatting, linting, tests, WASM build, and coverage passing.
 3. Open a PR; CI must be green.
 4. Follow the project’s code style (enforced by `rustfmt`).
 

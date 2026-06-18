@@ -1,3 +1,9 @@
+#![allow(deprecated)] // TODO: migrate Soroban events to #[contractevent].
+#![no_std]
+
+#[cfg(test)]
+extern crate std;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     Env, Symbol,
@@ -116,7 +122,10 @@ impl StableRouteRouter {
     /// Read the persisted schema version, or 1 if absent (the implicit
     /// pre-migration default).
     pub fn get_schema_version(env: Env) -> u32 {
-        env.storage().persistent().get(&DataKey::SchemaVersion).unwrap_or(1)
+        env.storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(1)
     }
 
     /// Migrate the schema from v1 to v2. Admin-gated; panics with
@@ -130,11 +139,17 @@ impl StableRouteRouter {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
         admin.require_auth();
-        let current: u32 = env.storage().persistent().get(&DataKey::SchemaVersion).unwrap_or(1);
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(1);
         if current != 1 {
             panic_with_error!(&env, RouterError::MigrationVersionMismatch);
         }
-        env.storage().persistent().set(&DataKey::SchemaVersion, &2u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SchemaVersion, &2u32);
     }
 
     /// Initialize the router with the operational admin.
@@ -149,8 +164,7 @@ impl StableRouteRouter {
         }
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Admin, &admin);
-        env.events()
-            .publish((symbol_short!("init"),), admin);
+        env.events().publish((symbol_short!("init"),), admin);
     }
 
     /// Returns true iff the router is currently paused.
@@ -215,10 +229,11 @@ impl StableRouteRouter {
         if pending != caller {
             panic_with_error!(&env, RouterError::NotPendingAdmin);
         }
-        env.storage().persistent().set(&DataKey::Admin, &caller.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Admin, &caller.clone());
         env.storage().persistent().remove(&DataKey::PendingAdmin);
-        env.events()
-            .publish((symbol_short!("adm_set"),), caller);
+        env.events().publish((symbol_short!("adm_set"),), caller);
     }
 
     /// Step 1 of admin handover. Current admin proposes a new admin;
@@ -276,10 +291,15 @@ impl StableRouteRouter {
     /// reported liquidity. Useful as a quick is-routable check.
     pub fn is_pair_active(env: Env, source: Symbol, destination: Symbol) -> bool {
         let s = env.storage().persistent();
-        if !s.get::<_, bool>(&DataKey::Pair(source.clone(), destination.clone())).unwrap_or(false) {
+        if !s
+            .get::<_, bool>(&DataKey::Pair(source.clone(), destination.clone()))
+            .unwrap_or(false)
+        {
             return false;
         }
-        s.get::<_, i128>(&DataKey::PairLiquidity(source, destination)).unwrap_or(0) > 0
+        s.get::<_, i128>(&DataKey::PairLiquidity(source, destination))
+            .unwrap_or(0)
+            > 0
     }
 
     /// Single round-trip aggregate read for the dashboard. Returns
@@ -287,12 +307,24 @@ impl StableRouteRouter {
     pub fn get_pair_info(env: Env, source: Symbol, destination: Symbol) -> PairInfo {
         let s = env.storage().persistent();
         PairInfo {
-            registered: s.get(&DataKey::Pair(source.clone(), destination.clone())).unwrap_or(false),
-            fee_bps: s.get(&DataKey::PairFeeBps(source.clone(), destination.clone())).unwrap_or(0),
-            min_amount: s.get(&DataKey::PairMinAmount(source.clone(), destination.clone())).unwrap_or(0),
-            max_amount: s.get(&DataKey::PairMaxAmount(source.clone(), destination.clone())).unwrap_or(i128::MAX),
-            liquidity: s.get(&DataKey::PairLiquidity(source.clone(), destination.clone())).unwrap_or(0),
-            last_route_at: s.get(&DataKey::PairLastRouteAt(source, destination)).unwrap_or(0),
+            registered: s
+                .get(&DataKey::Pair(source.clone(), destination.clone()))
+                .unwrap_or(false),
+            fee_bps: s
+                .get(&DataKey::PairFeeBps(source.clone(), destination.clone()))
+                .unwrap_or(0),
+            min_amount: s
+                .get(&DataKey::PairMinAmount(source.clone(), destination.clone()))
+                .unwrap_or(0),
+            max_amount: s
+                .get(&DataKey::PairMaxAmount(source.clone(), destination.clone()))
+                .unwrap_or(i128::MAX),
+            liquidity: s
+                .get(&DataKey::PairLiquidity(source.clone(), destination.clone()))
+                .unwrap_or(0),
+            last_route_at: s
+                .get(&DataKey::PairLastRouteAt(source, destination))
+                .unwrap_or(0),
         }
     }
 
@@ -320,17 +352,16 @@ impl StableRouteRouter {
             .persistent()
             .get(&DataKey::PairFeeBps(source, destination))
             .unwrap_or(0);
-        let fee = amount.checked_mul(fee_bps as i128).map(|n| n / BPS_DENOMINATOR).unwrap_or(0);
+        let fee = amount
+            .checked_mul(fee_bps as i128)
+            .map(|n| n / BPS_DENOMINATOR)
+            .unwrap_or(0);
         (fee, amount - fee)
     }
 
     /// Read the most recent ledger timestamp at which `compute_route_fee`
     /// touched this pair. None when never routed.
-    pub fn get_pair_last_route_at(
-        env: Env,
-        source: Symbol,
-        destination: Symbol,
-    ) -> Option<u64> {
+    pub fn get_pair_last_route_at(env: Env, source: Symbol, destination: Symbol) -> Option<u64> {
         env.storage()
             .persistent()
             .get(&DataKey::PairLastRouteAt(source, destination))
@@ -353,7 +384,9 @@ impl StableRouteRouter {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
         admin.require_auth();
-        env.storage().persistent().set(&DataKey::FeeRecipient, &recipient);
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeRecipient, &recipient);
     }
 
     /// Read the configured fee recipient, if any.
@@ -380,11 +413,14 @@ impl StableRouteRouter {
         if liquidity < 0 {
             panic_with_error!(&env, RouterError::AmountMustBePositive);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::PairLiquidity(source.clone(), destination.clone()), &liquidity);
-        env.events()
-            .publish((symbol_short!("liq_set"),), (source, destination, liquidity));
+        env.storage().persistent().set(
+            &DataKey::PairLiquidity(source.clone(), destination.clone()),
+            &liquidity,
+        );
+        env.events().publish(
+            (symbol_short!("liq_set"),),
+            (source, destination, liquidity),
+        );
     }
 
     /// Read the per-pair maximum (i128::MAX when absent).
@@ -483,9 +519,10 @@ impl StableRouteRouter {
         if fee_bps > MAX_FEE_BPS {
             panic_with_error!(&env, RouterError::FeeBpsTooHigh);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::PairFeeBps(source.clone(), destination.clone()), &fee_bps);
+        env.storage().persistent().set(
+            &DataKey::PairFeeBps(source.clone(), destination.clone()),
+            &fee_bps,
+        );
         env.events()
             .publish((symbol_short!("fee_set"),), (source, destination, fee_bps));
     }
@@ -507,12 +544,7 @@ impl StableRouteRouter {
     /// so off-chain callers always get a clear typed error instead of a
     /// silent zero. Math is integer division (truncating toward zero),
     /// matching every existing Stellar fee accounting precedent.
-    pub fn compute_route_fee(
-        env: Env,
-        source: Symbol,
-        destination: Symbol,
-        amount: i128,
-    ) -> i128 {
+    pub fn compute_route_fee(env: Env, source: Symbol, destination: Symbol, amount: i128) -> i128 {
         if amount <= 0 {
             panic_with_error!(&env, RouterError::AmountMustBePositive);
         }
@@ -560,8 +592,10 @@ impl StableRouteRouter {
             &DataKey::PairLastRouteAt(source.clone(), destination.clone()),
             &env.ledger().timestamp(),
         );
-        env.events()
-            .publish((symbol_short!("route"),), (source.clone(), destination.clone(), amount));
+        env.events().publish(
+            (symbol_short!("route"),),
+            (source.clone(), destination.clone(), amount),
+        );
         let fee_bps: u32 = env
             .storage()
             .persistent()
@@ -734,11 +768,7 @@ mod test {
     fn test_compute_route_fee_rejects_unregistered_pair() {
         let env = Env::default();
         let (client, _admin) = setup_initialized(&env);
-        client.compute_route_fee(
-            &symbol_short!("USDC"),
-            &symbol_short!("EURC"),
-            &1_000_i128,
-        );
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000_i128);
     }
 
     #[test]
@@ -748,5 +778,239 @@ mod test {
         let (client, _admin) = setup_initialized(&env);
         client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
         client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &0i128);
+    }
+
+    #[test]
+    fn test_schema_version_migration() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        assert_eq!(client.get_schema_version(), 1);
+        client.migrate_v1_to_v2();
+        assert_eq!(client.get_schema_version(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #13)")]
+    fn test_schema_migration_rejects_second_run() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.migrate_v1_to_v2();
+        client.migrate_v1_to_v2();
+    }
+
+    #[test]
+    fn test_pause_and_unpause_round_trip() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        assert!(!client.is_paused());
+        client.pause();
+        assert!(client.is_paused());
+        client.unpause();
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #9)")]
+    fn test_register_pair_rejects_when_paused() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.pause();
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+    }
+
+    #[test]
+    fn test_admin_transfer_flow() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        assert_eq!(client.get_pending_admin(), Some(next_admin.clone()));
+        client.accept_admin_transfer(&next_admin);
+        assert_eq!(client.get_admin(), Some(next_admin));
+        assert_eq!(client.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_clears_pending_admin() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        client.cancel_admin_transfer();
+        assert_eq!(client.get_pending_admin(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7)")]
+    fn test_accept_admin_transfer_rejects_missing_pending_admin() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let caller = Address::generate(&env);
+        client.accept_admin_transfer(&caller);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #8)")]
+    fn test_accept_admin_transfer_rejects_wrong_pending_admin() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let pending = Address::generate(&env);
+        let caller = Address::generate(&env);
+        client.propose_admin_transfer(&pending);
+        client.accept_admin_transfer(&caller);
+    }
+
+    #[test]
+    fn test_fee_recipient_round_trip() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        assert_eq!(client.get_fee_recipient(), None);
+        let recipient = Address::generate(&env);
+        client.set_fee_recipient(&recipient);
+        assert_eq!(client.get_fee_recipient(), Some(recipient));
+    }
+
+    #[test]
+    fn test_unregister_pair_removes_registration() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.unregister_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        assert!(!client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+    }
+
+    #[test]
+    fn test_pair_limits_liquidity_and_info_round_trip() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        assert!(!client.is_pair_active(&symbol_short!("USDC"), &symbol_short!("EURC")));
+
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &25u32);
+        client.set_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &10i128);
+        client.set_pair_max_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+        client.set_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC"), &500i128);
+
+        assert_eq!(
+            client.get_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            10
+        );
+        assert_eq!(
+            client.get_pair_max_amount(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            1_000
+        );
+        assert_eq!(
+            client.get_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            500
+        );
+        assert!(client.is_pair_active(&symbol_short!("USDC"), &symbol_short!("EURC")));
+
+        let info = client.get_pair_info(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        assert_eq!(
+            info,
+            PairInfo {
+                registered: true,
+                fee_bps: 25,
+                min_amount: 10,
+                max_amount: 1_000,
+                liquidity: 500,
+                last_route_at: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_quote_route_and_compute_route_update_counters() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &100u32);
+
+        assert_eq!(
+            client.quote_route(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128),
+            (10, 990)
+        );
+        assert_eq!(client.get_total_routes_all_time(), 0);
+
+        assert_eq!(
+            client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128),
+            10
+        );
+        assert_eq!(client.get_total_routes_all_time(), 1);
+        assert_eq!(
+            client.get_pair_last_route_at(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            Some(0)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_quote_route_rejects_zero_amount() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.quote_route(&symbol_short!("USDC"), &symbol_short!("EURC"), &0i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn test_quote_route_rejects_unregistered_pair() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.quote_route(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn test_compute_route_fee_rejects_below_minimum() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &10i128);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &9i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #11)")]
+    fn test_compute_route_fee_rejects_above_maximum() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_max_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &10i128);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &11i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #12)")]
+    fn test_compute_route_fee_rejects_insufficient_liquidity() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC"), &10i128);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &11i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_set_pair_liquidity_rejects_negative_value() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.set_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC"), &-1i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_set_pair_max_amount_rejects_zero() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.set_pair_max_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &0i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_set_pair_min_amount_rejects_negative_value() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.set_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &-1i128);
     }
 }
