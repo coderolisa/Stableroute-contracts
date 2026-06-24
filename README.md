@@ -49,6 +49,22 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 | `cargo fmt --all` | Format code |
 | `cargo fmt --all -- --check` | CI: verify formatting |
 
+## Governance timelock
+
+Admin handover can be put behind an optional delay so a compromised admin
+key cannot rotate control in a single ledger with no warning window.
+
+- `set_timelock(delay_seconds)` (admin) configures the delay. Default `0`
+  means instant handover (prior behaviour).
+- `propose_admin_transfer(new_admin)` stamps `PendingAdminEta = now +
+  delay` and emits a `queued` event carrying `(new_admin, eta)`.
+- `accept_admin_transfer(caller)` rejects with `TimelockNotElapsed` (#14)
+  until `ledger().timestamp() >= eta`, then emits `executed`.
+- `cancel_admin_transfer()` clears both the pending admin and its eta.
+
+Recommended delay for production governance: **24–72 hours** so users and
+watchers have time to react to a queued handover.
+
 ## CI/CD
 
 On every push/PR to `main`, GitHub Actions runs:

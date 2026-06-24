@@ -64,6 +64,13 @@ pub enum DataKey {
     PairLastRouteAt(Symbol, Symbol),
     /// On-chain storage schema version. Distinct from version().
     SchemaVersion,
+    /// Governance timelock delay, in seconds. When > 0, a proposed admin
+    /// handover can only be accepted after the delay has elapsed.
+    /// Defaults to 0 (instant) when unset, preserving prior behaviour.
+    Timelock,
+    /// Earliest ledger timestamp at which the currently pending admin
+    /// transfer may be accepted (`propose_admin_transfer` time + delay).
+    PendingAdminEta,
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -105,6 +112,9 @@ pub enum RouterError {
     InsufficientLiquidity = 12,
     /// `migrate_v1_to_v2` was called from a non-v1 schema.
     MigrationVersionMismatch = 13,
+    /// `accept_admin_transfer` was called before the governance timelock
+    /// delay elapsed.
+    TimelockNotElapsed = 14,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -200,10 +210,37 @@ impl StableRouteRouter {
         env.events().publish((symbol_short!("paused"),), true);
     }
 
-    /// Cancel a pending handover. No-op if none is pending.
+    /// Read the configured governance timelock delay, in seconds
+    /// (0 when unset — handover is instant).
+    pub fn get_timelock(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Timelock)
+            .unwrap_or(0)
+    }
+
+    /// Admin sets the governance timelock delay (seconds). Applies to the
+    /// **next** `propose_admin_transfer`; already-queued actions keep the
+    /// eta they were stamped with. Pass 0 to disable (instant handover).
+    pub fn set_timelock(env: Env, delay_seconds: u64) {
+        Self::require_admin(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Timelock, &delay_seconds);
+    }
+
+    /// Read the earliest timestamp at which the pending admin transfer may
+    /// be accepted, or `None` when no transfer is queued.
+    pub fn get_pending_admin_eta(env: Env) -> Option<u64> {
+        env.storage().persistent().get(&DataKey::PendingAdminEta)
+    }
+
+    /// Cancel a pending handover, clearing both the pending admin and its
+    /// queued eta. No-op if none is pending.
     pub fn cancel_admin_transfer(env: Env) {
         Self::require_admin(&env);
         env.storage().persistent().remove(&DataKey::PendingAdmin);
+        env.storage().persistent().remove(&DataKey::PendingAdminEta);
     }
 
     /// Read the pending admin if any.
@@ -224,22 +261,47 @@ impl StableRouteRouter {
         if pending != caller {
             panic_with_error!(&env, RouterError::NotPendingAdmin);
         }
+        // Honour the governance timelock: the handover cannot execute until
+        // its stamped eta has been reached.
+        let eta: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminEta)
+            .unwrap_or(0);
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, RouterError::TimelockNotElapsed);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::Admin, &caller.clone());
         env.storage().persistent().remove(&DataKey::PendingAdmin);
-        env.events().publish((symbol_short!("adm_set"),), caller);
+        env.storage().persistent().remove(&DataKey::PendingAdminEta);
+        env.events().publish((symbol_short!("executed"),), caller);
     }
 
     /// Step 1 of admin handover. Current admin proposes a new admin;
-    /// the new admin must then accept via `accept_admin_transfer`.
+    /// the new admin must then accept via `accept_admin_transfer` once the
+    /// governance timelock (if any) has elapsed.
+    ///
+    /// Stamps `PendingAdminEta = now + timelock` and emits a `queued`
+    /// event carrying the new admin and the eta so watchers get a warning
+    /// window before control can actually change hands.
     pub fn propose_admin_transfer(env: Env, new_admin: Address) {
         Self::require_admin(&env);
+        let delay: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Timelock)
+            .unwrap_or(0);
+        let eta = env.ledger().timestamp().saturating_add(delay);
         env.storage()
             .persistent()
             .set(&DataKey::PendingAdmin, &new_admin.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAdminEta, &eta);
         env.events()
-            .publish((symbol_short!("adm_prop"),), new_admin);
+            .publish((symbol_short!("queued"),), (new_admin, eta));
     }
 
     /// Returns the admin set at `init`, if any.
@@ -575,7 +637,11 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _};
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Ledger},
+        IntoVal,
+    };
 
     fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
@@ -793,6 +859,61 @@ mod test {
         client.propose_admin_transfer(&next_admin);
         client.cancel_admin_transfer();
         assert_eq!(client.get_pending_admin(), None);
+        assert_eq!(client.get_pending_admin_eta(), None);
+    }
+
+    // --- #21: governance timelock ---
+
+    /// Timelock defaults to 0 (instant handover) when unset.
+    #[test]
+    fn test_timelock_defaults_to_zero() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        assert_eq!(client.get_timelock(), 0);
+    }
+
+    /// With a delay set, accepting the handover before the eta is rejected
+    /// with TimelockNotElapsed (#14).
+    #[test]
+    #[should_panic(expected = "Error(Contract, #14)")]
+    fn test_timelock_blocks_early_accept() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin) = setup_initialized(&env);
+        client.set_timelock(&100);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        assert_eq!(client.get_pending_admin_eta(), Some(1_100));
+        client.accept_admin_transfer(&next_admin); // still at t=1_000
+    }
+
+    /// After the delay elapses, the handover executes normally.
+    #[test]
+    fn test_timelock_allows_accept_after_delay() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin) = setup_initialized(&env);
+        client.set_timelock(&100);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        env.ledger().set_timestamp(1_100);
+        client.accept_admin_transfer(&next_admin);
+        assert_eq!(client.get_admin(), Some(next_admin));
+        assert_eq!(client.get_pending_admin_eta(), None);
+    }
+
+    /// Cancelling a queued transfer clears both the pending admin and eta.
+    #[test]
+    fn test_timelock_cancel_clears_queue() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin) = setup_initialized(&env);
+        client.set_timelock(&100);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        client.cancel_admin_transfer();
+        assert_eq!(client.get_pending_admin(), None);
+        assert_eq!(client.get_pending_admin_eta(), None);
     }
 
     #[test]
