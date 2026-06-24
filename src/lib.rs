@@ -575,7 +575,7 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _};
+    use soroban_sdk::{symbol_short, testutils::Address as _, IntoVal};
 
     fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
@@ -1016,5 +1016,70 @@ mod test {
         let contract_id = env.register(StableRouteRouter, ());
         let client = StableRouteRouterClient::new(&env, &contract_id);
         client.pause(); // no admin stored yet
+    }
+}
+
+/// Issue #16 — fee-computation arithmetic at extreme amounts.
+/// Exercises the `checked_mul` overflow path (returns 0), truncating integer
+/// division, quote/compute parity, and the saturating route counter.
+#[cfg(test)]
+mod test_i16_fee_arithmetic {
+    use super::*;
+    use soroban_sdk::{symbol_short, testutils::Address as _};
+
+    /// Register a pair with wide bounds and liquidity so the boundary guards
+    /// never pre-empt the arithmetic path under test.
+    fn setup_pair(env: &Env) -> (StableRouteRouterClient<'_>, Symbol, Symbol) {
+        env.mock_all_auths();
+        let id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(env, &id);
+        client.init(&Address::generate(env));
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_max_amount(&s, &d, &i128::MAX);
+        client.set_pair_liquidity(&s, &d, &i128::MAX);
+        (client, s, d)
+    }
+
+    #[test]
+    fn test_overflow_path_returns_zero() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_pair_fee_bps(&s, &d, &2u32);
+        // 2 * i128::MAX overflows checked_mul, so the fee defaults to 0
+        // instead of panicking.
+        assert_eq!(client.compute_route_fee(&s, &d, &i128::MAX), 0);
+    }
+
+    #[test]
+    fn test_truncating_division_rounds_toward_zero() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_pair_fee_bps(&s, &d, &3u32);
+        // 12_345 * 3 / 10_000 = 3.7035 -> truncates to 3.
+        assert_eq!(client.compute_route_fee(&s, &d, &12_345i128), 3);
+    }
+
+    #[test]
+    fn test_quote_matches_compute_fee() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_pair_fee_bps(&s, &d, &50u32);
+        let (qfee, qnet) = client.quote_route(&s, &d, &1_000_000i128);
+        let cfee = client.compute_route_fee(&s, &d, &1_000_000i128);
+        assert_eq!(qfee, cfee);
+        assert_eq!(qnet, 1_000_000 - qfee);
+    }
+
+    #[test]
+    fn test_route_counter_increments_and_never_panics() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_pair_fee_bps(&s, &d, &10u32);
+        assert_eq!(client.get_total_routes_all_time(), 0);
+        client.compute_route_fee(&s, &d, &1_000i128);
+        assert_eq!(client.get_total_routes_all_time(), 1);
+        client.compute_route_fee(&s, &d, &1_000i128);
+        assert_eq!(client.get_total_routes_all_time(), 2);
     }
 }
