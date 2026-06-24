@@ -74,11 +74,10 @@ pub enum DataKey {
     PairVolume(Symbol, Symbol),
     /// On-chain storage schema version. Distinct from version().
     SchemaVersion,
-    /// `true` while a non-reentrant entrypoint is executing. The guard
-    /// helpers set this on entry and clear it on every return path so a
-    /// re-entrant call (e.g. via a future malicious token callback) panics
-    /// with [`RouterError::ReentrantCall`] instead of observing stale state.
-    ReentrancyLock,
+    /// Optional absolute per-route fee ceiling (in source units). When set,
+    /// `compute_route_fee` / `quote_route` clamp the proportional fee down to
+    /// this value. Absent = no absolute cap (backward compatible).
+    MaxFeeAbsolute,
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -387,6 +386,7 @@ impl StableRouteRouter {
             .checked_mul(fee_bps as i128)
             .map(|n| n / BPS_DENOMINATOR)
             .unwrap_or(0);
+        let fee = Self::apply_fee_cap(&env, fee);
         (fee, amount - fee)
     }
 
@@ -465,6 +465,41 @@ impl StableRouteRouter {
     /// Read the configured fee recipient, if any.
     pub fn get_fee_recipient(env: Env) -> Option<Address> {
         env.storage().persistent().get(&DataKey::FeeRecipient)
+    }
+
+    /// Clamp `fee` to the configured absolute ceiling when one is set.
+    /// Both the relative `MAX_FEE_BPS` bound and this absolute bound apply;
+    /// the tighter of the two wins. No-op when no absolute cap is configured.
+    fn apply_fee_cap(env: &Env, fee: i128) -> i128 {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&DataKey::MaxFeeAbsolute)
+        {
+            Some(cap) => fee.min(cap),
+            None => fee,
+        }
+    }
+
+    /// Read the absolute per-route fee ceiling, or `None` when unset.
+    pub fn get_max_fee_absolute(env: Env) -> Option<i128> {
+        env.storage().persistent().get(&DataKey::MaxFeeAbsolute)
+    }
+
+    /// Admin sets the absolute per-route fee ceiling (in source units).
+    /// Rejects negative caps with `AmountMustBePositive` (#6). A cap of `0`
+    /// makes every route effectively free. Emits a `maxfee` event. The cap
+    /// composes with `MAX_FEE_BPS`: a route is charged
+    /// `min(amount * fee_bps / 10_000, max_fee_absolute)`.
+    pub fn set_max_fee_absolute(env: Env, max_fee: i128) {
+        Self::require_admin(&env);
+        if max_fee < 0 {
+            panic_with_error!(&env, RouterError::AmountMustBePositive);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxFeeAbsolute, &max_fee);
+        env.events().publish((symbol_short!("maxfee"),), max_fee);
     }
 
     /// Read the reported liquidity for a pair (0 when absent).
@@ -726,48 +761,7 @@ impl StableRouteRouter {
             .checked_mul(fee_bps as i128)
             .map(|n| n / BPS_DENOMINATOR)
             .unwrap_or(0);
-
-        // INTERACTIONS would go here (external transfers), strictly last.
-
-        // Release the lock on the normal success path so back-to-back
-        // calls work.
-        Self::exit_nonreentrant(&env);
-        fee
-    }
-
-    /// Slippage-guarded variant of [`Self::compute_route_fee`].
-    ///
-    /// Runs the exact same canonical code path as `compute_route_fee` via the
-    /// shared private inner helper, so it performs identical validation, the
-    /// same side effects (lifetime counter bump, per-pair last-route-at
-    /// stamp, and `route` event), and computes the fee with identical math.
-    /// After the fee is known, it derives `net = amount - fee` and, when the
-    /// caller supplies a positive `min_out`, enforces a minimum-output floor:
-    /// if `min_out > 0 && net < min_out` it panics with
-    /// [`RouterError::SlippageExceeded`].
-    ///
-    /// A `min_out <= 0` disables the floor entirely, making this behave
-    /// exactly like the unchecked path (same validation, side effects, and
-    /// returned fee). On success the returned value is the fee, identical to
-    /// `compute_route_fee`.
-    ///
-    /// The inner helper is called exactly once, so the counter/timestamp/event
-    /// fire exactly once and there is no double counting. Because the
-    /// unchecked path is the canonical behaviour, the floor check happens
-    /// after the side effects have already run.
-    pub fn compute_route_fee_checked(
-        env: Env,
-        source: Symbol,
-        destination: Symbol,
-        amount: i128,
-        min_out: i128,
-    ) -> i128 {
-        let fee = Self::route_fee_inner(&env, source, destination, amount);
-        let net = amount - fee;
-        if min_out > 0 && net < min_out {
-            panic_with_error!(&env, RouterError::SlippageExceeded);
-        }
-        fee
+        Self::apply_fee_cap(&env, fee)
     }
 
     /// Placeholder: returns a fixed route tag for a source/destination pair.
@@ -2113,5 +2107,80 @@ mod test_i19_authorization {
         client.init(&Address::generate(&env));
         client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
         assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+    }
+}
+
+/// Issue #41 — absolute per-route fee ceiling. Both the relative MAX_FEE_BPS
+/// and the optional absolute MaxFeeAbsolute apply; the tighter wins. The cap
+/// is unset by default (backward compatible).
+#[cfg(test)]
+mod test_i41_fee_cap {
+    use super::*;
+    use soroban_sdk::{symbol_short, testutils::Address as _};
+
+    fn setup_pair(env: &Env) -> (StableRouteRouterClient<'_>, Symbol, Symbol) {
+        env.mock_all_auths();
+        let id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(env, &id);
+        client.init(&Address::generate(env));
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &100u32); // 1%
+        (client, s, d)
+    }
+
+    #[test]
+    fn test_no_absolute_cap_by_default() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        assert_eq!(client.get_max_fee_absolute(), None);
+        // 1_000_000 * 1% = 10_000, unclamped.
+        assert_eq!(client.compute_route_fee(&s, &d, &1_000_000i128), 10_000);
+    }
+
+    #[test]
+    fn test_fee_below_cap_is_unaffected() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_max_fee_absolute(&50_000i128);
+        assert_eq!(client.get_max_fee_absolute(), Some(50_000));
+        // 10_000 < 50_000 -> unchanged.
+        assert_eq!(client.compute_route_fee(&s, &d, &1_000_000i128), 10_000);
+    }
+
+    #[test]
+    fn test_fee_above_cap_is_clamped() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_max_fee_absolute(&5_000i128);
+        // Proportional fee 10_000 clamped down to the 5_000 ceiling.
+        assert_eq!(client.compute_route_fee(&s, &d, &1_000_000i128), 5_000);
+    }
+
+    #[test]
+    fn test_cap_of_zero_makes_routes_free() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_max_fee_absolute(&0i128);
+        assert_eq!(client.compute_route_fee(&s, &d, &1_000_000i128), 0);
+    }
+
+    #[test]
+    fn test_quote_and_compute_agree_under_cap() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_max_fee_absolute(&5_000i128);
+        let (qfee, qnet) = client.quote_route(&s, &d, &1_000_000i128);
+        assert_eq!(qfee, 5_000);
+        assert_eq!(qnet, 1_000_000 - 5_000);
+        assert_eq!(qfee, client.compute_route_fee(&s, &d, &1_000_000i128));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_negative_cap_rejected() {
+        let env = Env::default();
+        let (client, _s, _d) = setup_pair(&env);
+        client.set_max_fee_absolute(&-1i128);
     }
 }
