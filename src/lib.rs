@@ -780,11 +780,7 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{
-        symbol_short,
-        testutils::{Address as _, Events, Ledger},
-        IntoVal,
-    };
+    use soroban_sdk::{symbol_short, testutils::Address as _, IntoVal};
 
     fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         let (client, admin, _id) = setup_initialized_with_id(env);
@@ -1573,5 +1569,87 @@ mod test {
         let env = Env::default();
         let client = setup_uninitialized(&env);
         client.set_pair_max_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &1i128);
+    }
+}
+
+/// Issue #14 — pause/unpause gating across state-changing entrypoints.
+/// Covers the default-false flag, event emission, the `ContractPaused` (#9)
+/// rejection on gated entrypoints, recovery after unpause, and idempotency.
+#[cfg(test)]
+mod test_i14_pause_gating {
+    use super::*;
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Events},
+    };
+
+    /// Register + init a router with all auths mocked.
+    fn setup(env: &Env) -> StableRouteRouterClient<'_> {
+        env.mock_all_auths();
+        let id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(env, &id);
+        client.init(&Address::generate(env));
+        client
+    }
+
+    #[test]
+    fn test_is_paused_defaults_false_and_toggles() {
+        let env = Env::default();
+        let client = setup(&env);
+        assert!(!client.is_paused());
+        client.pause();
+        assert!(client.is_paused());
+        client.unpause();
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_pause_emits_event() {
+        let env = Env::default();
+        let client = setup(&env);
+        client.pause();
+        // pause() publishes a `paused` event; assert one was emitted.
+        assert!(!env.events().all().events().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #9)")]
+    fn test_register_pair_rejected_while_paused() {
+        let env = Env::default();
+        let client = setup(&env);
+        client.pause();
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #9)")]
+    fn test_set_pair_fee_bps_rejected_while_paused() {
+        let env = Env::default();
+        let client = setup(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.pause();
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &10u32);
+    }
+
+    #[test]
+    fn test_gated_entrypoint_succeeds_after_unpause() {
+        let env = Env::default();
+        let client = setup(&env);
+        client.pause();
+        client.unpause();
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+    }
+
+    #[test]
+    fn test_double_pause_and_double_unpause_idempotent() {
+        let env = Env::default();
+        let client = setup(&env);
+        client.pause();
+        client.pause();
+        assert!(client.is_paused());
+        client.unpause();
+        client.unpause();
+        assert!(!client.is_paused());
     }
 }
