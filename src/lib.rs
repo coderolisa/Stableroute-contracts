@@ -575,7 +575,7 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _};
+    use soroban_sdk::{symbol_short, testutils::Address as _, IntoVal};
 
     fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
