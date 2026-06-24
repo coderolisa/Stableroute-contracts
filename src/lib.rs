@@ -1888,3 +1888,99 @@ mod test_i17_migration {
         client.migrate_v1_to_v2();
     }
 }
+
+/// Issue #18 — aggregate read surface: `get_pair_info` defaults/values,
+/// `is_pair_active`, `quote_route` non-mutation + parity, and
+/// `get_pair_last_route_at` before/after a route.
+#[cfg(test)]
+mod test_i18_read_surface {
+    use super::*;
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Ledger},
+    };
+
+    fn setup(env: &Env) -> StableRouteRouterClient<'_> {
+        env.mock_all_auths();
+        let id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(env, &id);
+        client.init(&Address::generate(env));
+        client
+    }
+
+    #[test]
+    fn test_pair_info_defaults_for_unconfigured_pair() {
+        let env = Env::default();
+        let client = setup(&env);
+        let info = client.get_pair_info(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        assert_eq!(
+            info,
+            PairInfo {
+                registered: false,
+                fee_bps: 0,
+                min_amount: 0,
+                max_amount: i128::MAX,
+                liquidity: 0,
+                last_route_at: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_pair_info_reflects_configuration() {
+        let env = Env::default();
+        let client = setup(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &25u32);
+        client.set_pair_min_amount(&s, &d, &10i128);
+        client.set_pair_max_amount(&s, &d, &1_000i128);
+        client.set_pair_liquidity(&s, &d, &500i128);
+        let info = client.get_pair_info(&s, &d);
+        assert!(info.registered);
+        assert_eq!(info.fee_bps, 25);
+        assert_eq!(info.min_amount, 10);
+        assert_eq!(info.max_amount, 1_000);
+        assert_eq!(info.liquidity, 500);
+    }
+
+    #[test]
+    fn test_is_pair_active_requires_registration_and_liquidity() {
+        let env = Env::default();
+        let client = setup(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        assert!(!client.is_pair_active(&s, &d));
+        client.register_pair(&s, &d);
+        // Registered but zero liquidity is still inactive.
+        assert!(!client.is_pair_active(&s, &d));
+        client.set_pair_liquidity(&s, &d, &1i128);
+        assert!(client.is_pair_active(&s, &d));
+    }
+
+    #[test]
+    fn test_quote_route_is_non_mutating_and_matches_compute() {
+        let env = Env::default();
+        let client = setup(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &100u32);
+        let (qfee, _net) = client.quote_route(&s, &d, &1_000i128);
+        // Quote leaves the counter and timestamp untouched.
+        assert_eq!(client.get_total_routes_all_time(), 0);
+        assert_eq!(client.get_pair_last_route_at(&s, &d), None);
+        // And reports the same fee compute_route_fee would.
+        assert_eq!(qfee, client.compute_route_fee(&s, &d, &1_000i128));
+    }
+
+    #[test]
+    fn test_last_route_at_none_before_some_after() {
+        let env = Env::default();
+        let client = setup(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        env.ledger().set_timestamp(424_242);
+        assert_eq!(client.get_pair_last_route_at(&s, &d), None);
+        client.compute_route_fee(&s, &d, &1_000i128);
+        assert_eq!(client.get_pair_last_route_at(&s, &d), Some(424_242));
+    }
+}
