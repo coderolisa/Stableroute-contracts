@@ -53,17 +53,28 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 | `cargo fmt --all` | Format code |
 | `cargo fmt --all -- --check` | CI: verify formatting |
 
-## Emergency stop (pause) guarantee
+## Secure deployment
 
-When the admin calls `pause()`, every **state-mutating** entrypoint is
-blocked with `ContractPaused` (#9) — including `compute_route_fee`, which
-records a route (`TotalRoutesAllTime`), stamps `PairLastRouteAt`, and
-emits the `route` event. This guarantees that once an admin trips the
-emergency stop, no further routing accounting can occur until `unpause()`.
+The admin is set **atomically at deploy time** by the contract
+constructor, which closes the init front-running window (a deployed but
+uninitialized contract whose admin slot anyone could claim).
 
-The read-only `quote_route` is intentionally **left available** while
-paused so integrators can keep planning routes for when the router
-resumes; it never mutates state.
+Deploy with the admin passed as a constructor argument:
+
+```bash
+# Soroban CLI: pass --admin as a constructor arg at deploy
+soroban contract deploy --wasm <router.wasm> -- --admin <ADMIN_G...>
+```
+
+```rust
+// Rust tests / SDK
+let contract_id = env.register(StableRouteRouter, (admin.clone(),));
+```
+
+The legacy `init(admin)` entrypoint is retained for ABI compatibility but
+**always panics with `AlreadyInitialized` (#1)** — the admin slot is
+already populated by the constructor, so `init` can never claim it and an
+attacker can never use it to seize the admin role.
 
 ## CI/CD
 
