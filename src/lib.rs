@@ -627,24 +627,23 @@ impl StableRouteRouter {
     /// so off-chain callers always get a clear typed error instead of a
     /// silent zero. Math is integer division (truncating toward zero),
     /// matching every existing Stellar fee accounting precedent.
+    ///
+    /// Honours the emergency stop: while the router is paused this
+    /// entrypoint panics with [`RouterError::ContractPaused`] so no route
+    /// can be recorded (the `TotalRoutesAllTime` counter, the
+    /// `PairLastRouteAt` stamp, and the `route` event are all gated). The
+    /// read-only `quote_route` is intentionally left available while
+    /// paused so integrators can keep planning routes for when the router
+    /// resumes.
     pub fn compute_route_fee(env: Env, source: Symbol, destination: Symbol, amount: i128) -> i128 {
-        // --- Checks-Effects-Interactions discipline ---
-        //
-        // 1. CHECKS: validate every argument and read-only precondition
-        //    before mutating any state. The cheap argument check runs
-        //    before the reentrancy lock is acquired; the remaining checks
-        //    run under the lock.
-        // 2. EFFECTS: write the counter and timestamp, then emit the route
-        //    event, all while the reentrancy lock is held.
-        // 3. INTERACTIONS: any external token transfer MUST happen LAST,
-        //    after every effect is committed. None exist yet — this guard
-        //    is preparatory so the future fund-moving path is safe by
-        //    construction. Because no external call is made, the lock is
-        //    released on the normal success path so back-to-back calls
-        //    succeed; on any panic the transaction rolls back, which also
-        //    clears the lock.
-
-        // CHECKS (cheap argument validation, pre-lock).
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, RouterError::ContractPaused);
+        }
         if amount <= 0 {
             panic_with_error!(env, RouterError::AmountMustBePositive);
         }
@@ -998,6 +997,58 @@ mod test {
         let (client, _admin) = setup_initialized(&env);
         client.pause();
         client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+    }
+
+    /// The emergency stop must block route accounting: while paused,
+    /// `compute_route_fee` panics with `ContractPaused` (#9) and never
+    /// touches the counter / timestamp.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #9)")]
+    fn test_compute_route_fee_rejects_when_paused() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &50u32);
+        client.pause();
+        client.compute_route_fee(
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &1_000_000_i128,
+        );
+    }
+
+    /// Routing resumes cleanly after an unpause, and no route was recorded
+    /// during the paused window.
+    #[test]
+    fn test_compute_route_fee_resumes_after_unpause() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &50u32);
+        client.pause();
+        client.unpause();
+        let fee = client.compute_route_fee(
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &1_000_000_i128,
+        );
+        assert_eq!(fee, 5_000);
+        assert_eq!(client.get_total_routes_all_time(), 1);
+    }
+
+    /// Read-only quotes stay available while paused (documented policy:
+    /// block state-mutating routes, keep quotes open for planning).
+    #[test]
+    fn test_quote_route_allowed_while_paused() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &100u32);
+        client.pause();
+        assert_eq!(
+            client.quote_route(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128),
+            (10, 990)
+        );
     }
 
     #[test]

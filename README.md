@@ -53,19 +53,17 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 | `cargo fmt --all` | Format code |
 | `cargo fmt --all -- --check` | CI: verify formatting |
 
-## Fee model
+## Emergency stop (pause) guarantee
 
-A route is charged on two independent bounds — the **tighter wins**:
+When the admin calls `pause()`, every **state-mutating** entrypoint is
+blocked with `ContractPaused` (#9) — including `compute_route_fee`, which
+records a route (`TotalRoutesAllTime`), stamps `PairLastRouteAt`, and
+emits the `route` event. This guarantees that once an admin trips the
+emergency stop, no further routing accounting can occur until `unpause()`.
 
-- **Relative** — `fee = amount * fee_bps / 10_000`, with `fee_bps` capped at
-  `MAX_FEE_BPS` (10%) at write time.
-- **Absolute** — an optional protocol-wide ceiling set via
-  `set_max_fee_absolute` (admin-gated, non-negative). When set, the
-  proportional fee is clamped to it: `min(fee, max_fee_absolute)`. Unset by
-  default (fully backward compatible); a cap of `0` makes every route free.
-
-Both `compute_route_fee` and `quote_route` apply the clamp identically, so a
-quote always matches what a route will charge.
+The read-only `quote_route` is intentionally **left available** while
+paused so integrators can keep planning routes for when the router
+resumes; it never mutates state.
 
 ## CI/CD
 
