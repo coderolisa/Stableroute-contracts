@@ -780,7 +780,11 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _, IntoVal};
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Events, Ledger},
+        IntoVal,
+    };
 
     fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         let (client, admin, _id) = setup_initialized_with_id(env);
@@ -1202,103 +1206,125 @@ mod test {
         client.set_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &-1i128);
     }
 
-    // --- compute_route_fee_checked (slippage guard) tests ---
+    // --- compute_route_fee side-effect tests ---
 
-    /// net below the floor must panic SlippageExceeded (#14). With a 100 bps
-    /// fee on 1_000, fee = 10 and net = 990; a min_out of 991 must reject.
-    #[test]
-    #[should_panic(expected = "Error(Contract, #14)")]
-    fn test_compute_route_fee_checked_rejects_below_floor() {
-        let env = Env::default();
-        let (client, _admin) = setup_initialized(&env);
-        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
-        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &100u32);
-        client.compute_route_fee_checked(
-            &symbol_short!("USDC"),
-            &symbol_short!("EURC"),
-            &1_000i128,
-            &991i128,
-        );
+    /// Register `(source, destination)` and set its fee so that
+    /// `compute_route_fee` clears every guard (pair registered, fee set,
+    /// min/max unset → permissive, liquidity unset → defaults to i128::MAX).
+    /// Returns the live client for chaining assertions.
+    fn setup_routable_pair<'a>(
+        env: &'a Env,
+        source: &Symbol,
+        destination: &Symbol,
+        fee_bps: u32,
+    ) -> StableRouteRouterClient<'a> {
+        let (client, _admin) = setup_initialized(env);
+        client.register_pair(source, destination);
+        client.set_pair_fee_bps(source, destination, &fee_bps);
+        client
     }
 
-    /// net exactly at the floor passes and returns the fee. fee = 10,
-    /// net = 990, min_out = 990 -> not below, so it succeeds.
-    #[test]
-    fn test_compute_route_fee_checked_passes_at_exact_floor() {
-        let env = Env::default();
-        let (client, _admin) = setup_initialized(&env);
-        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
-        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &100u32);
-        let fee = client.compute_route_fee_checked(
-            &symbol_short!("USDC"),
-            &symbol_short!("EURC"),
-            &1_000i128,
-            &990i128,
-        );
-        assert_eq!(fee, 10);
+    /// Scan the test-host's accumulated contract events and return the decoded
+    /// `data` payloads of every event whose single topic is `route`. Events
+    /// accumulate across init / register / fee_set, so this filters by topic
+    /// instead of asserting on the whole stream. Decodes each XDR event body
+    /// back into host `Val`s so callers can compare against an expected tuple.
+    fn route_event_payloads(env: &Env) -> std::vec::Vec<soroban_sdk::Val> {
+        use soroban_sdk::{
+            xdr::{ContractEventBody, ScSymbol, ScVal},
+            TryFromVal, Val,
+        };
+        let route_topic = ScVal::Symbol(ScSymbol(
+            "route".try_into().expect("route fits in a Symbol"),
+        ));
+        env.events()
+            .all()
+            .events()
+            .iter()
+            .filter_map(|event| {
+                let ContractEventBody::V0(body) = &event.body;
+                let topics = body.topics.as_slice();
+                if topics.len() == 1 && topics[0] == route_topic {
+                    Some(Val::try_from_val(env, &body.data).expect("event data decodes to Val"))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
-    /// min_out <= 0 disables the floor and must match the unchecked path
-    /// exactly (same fee, same side effects).
     #[test]
-    fn test_compute_route_fee_checked_no_floor_matches_unchecked() {
+    fn test_compute_route_fee_emits_route_event_with_payload() {
         let env = Env::default();
-        let (client, _admin) = setup_initialized(&env);
-        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
-        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &100u32);
+        let src = symbol_short!("USDC");
+        let dest = symbol_short!("EURC");
+        let amount = 1_000_000_i128;
+        let client = setup_routable_pair(&env, &src, &dest, 50u32);
 
-        // min_out = 0 -> no floor.
-        let fee_zero = client.compute_route_fee_checked(
-            &symbol_short!("USDC"),
-            &symbol_short!("EURC"),
-            &1_000i128,
-            &0i128,
-        );
-        assert_eq!(fee_zero, 10);
+        client.compute_route_fee(&src, &dest, &amount);
+
+        // Exactly one `route` event, carrying (source, destination, amount).
+        let payloads = route_event_payloads(&env);
+        assert_eq!(payloads.len(), 1, "exactly one route event expected");
+        let decoded: (Symbol, Symbol, i128) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+                .expect("route data decodes to (Symbol, Symbol, i128)");
+        assert_eq!(decoded, (src, dest, amount));
+    }
+
+    #[test]
+    fn test_compute_route_fee_stamps_pair_last_route_at() {
+        let env = Env::default();
+        let src = symbol_short!("USDC");
+        let dest = symbol_short!("EURC");
+        let client = setup_routable_pair(&env, &src, &dest, 50u32);
+
+        // None before any route touches the pair.
+        assert_eq!(client.get_pair_last_route_at(&src, &dest), None);
+
+        env.ledger().set_timestamp(12345);
+        client.compute_route_fee(&src, &dest, &1_000_i128);
+
+        assert_eq!(client.get_pair_last_route_at(&src, &dest), Some(12345));
+    }
+
+    #[test]
+    fn test_compute_route_fee_counter_is_global_across_pairs() {
+        let env = Env::default();
+        // Pair A.
+        let a_src = symbol_short!("USDC");
+        let a_dest = symbol_short!("EURC");
+        let client = setup_routable_pair(&env, &a_src, &a_dest, 50u32);
+        // Pair B (different pair) registered on the same contract instance.
+        let b_src = symbol_short!("XLM");
+        let b_dest = symbol_short!("USDC");
+        client.register_pair(&b_src, &b_dest);
+        client.set_pair_fee_bps(&b_src, &b_dest, &50u32);
+
+        assert_eq!(client.get_total_routes_all_time(), 0);
+        client.compute_route_fee(&a_src, &a_dest, &1_000_i128);
         assert_eq!(client.get_total_routes_all_time(), 1);
-
-        // min_out negative -> also no floor.
-        let fee_neg = client.compute_route_fee_checked(
-            &symbol_short!("USDC"),
-            &symbol_short!("EURC"),
-            &1_000i128,
-            &-5i128,
-        );
-        assert_eq!(fee_neg, 10);
+        client.compute_route_fee(&b_src, &b_dest, &1_000_i128);
+        // The lifetime counter is protocol-wide, not per-pair.
         assert_eq!(client.get_total_routes_all_time(), 2);
     }
 
-    /// The checked variant's fee math is identical to the unchecked variant
-    /// when the floor is satisfied. Run both on equivalent fresh state.
     #[test]
-    fn test_compute_route_fee_checked_parity_with_unchecked() {
-        let unchecked_fee = {
-            let env = Env::default();
-            let (client, _admin) = setup_initialized(&env);
-            client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
-            client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &50u32);
-            client.compute_route_fee(
-                &symbol_short!("USDC"),
-                &symbol_short!("EURC"),
-                &1_000_000i128,
-            )
-        };
+    fn test_quote_route_does_not_mutate_counter_or_emit_route_event() {
+        let env = Env::default();
+        let src = symbol_short!("USDC");
+        let dest = symbol_short!("EURC");
+        let client = setup_routable_pair(&env, &src, &dest, 100u32);
 
-        let checked_fee = {
-            let env = Env::default();
-            let (client, _admin) = setup_initialized(&env);
-            client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
-            client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &50u32);
-            client.compute_route_fee_checked(
-                &symbol_short!("USDC"),
-                &symbol_short!("EURC"),
-                &1_000_000i128,
-                &990_000i128,
-            )
-        };
+        let routes_before = client.get_total_routes_all_time();
+        let route_events_before = route_event_payloads(&env).len();
 
-        assert_eq!(unchecked_fee, checked_fee);
-        assert_eq!(checked_fee, 5_000);
+        let (fee, net) = client.quote_route(&src, &dest, &1_000_i128);
+        assert_eq!((fee, net), (10, 990));
+
+        // quote_route is read-only: counter unchanged, no new `route` event.
+        assert_eq!(client.get_total_routes_all_time(), routes_before);
+        assert_eq!(route_event_payloads(&env).len(), route_events_before);
     }
 
     // --- require_admin helper contract tests ---

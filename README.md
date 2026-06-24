@@ -97,38 +97,27 @@ tiers) and the PR checklist.
 
 **`require_admin`** — every admin-gated entrypoint in `StableRouteRouter` calls the private `fn require_admin(env: &Env) -> Address` helper instead of repeating the load-unwrap-require_auth block inline. When adding a new admin-gated entrypoint, start the body with `Self::require_admin(&env);`. Do not duplicate the pattern manually.
 
-## Reentrancy & call ordering
+## Testing notes
 
-`StableRouteRouter` enforces a single-entry reentrancy guard plus a
-Checks-Effects-Interactions (CEI) discipline so that the future
-fund-moving path is safe by construction.
+### `compute_route_fee` side-effect matrix
 
-**Reentrancy guard.** A `DataKey::ReentrancyLock` boolean tracks whether a
-guarded entrypoint is mid-execution. Two private helpers manage it:
+`compute_route_fee` is the only mutating read path. On success it performs three
+side effects, each covered by a dedicated test in `src/lib.rs`:
 
-- `enter_nonreentrant(env)` — panics with `RouterError::ReentrantCall`
-  (error `#14`) if the lock is already held, otherwise sets it.
-- `exit_nonreentrant(env)` — clears the lock; it is called on the normal
-  success path so back-to-back invocations work. On any panic the
-  transaction rolls back, which also clears the lock.
+| Side effect | Storage / event | Test |
+|-------------|-----------------|------|
+| Lifetime counter | `DataKey::TotalRoutesAllTime` (saturating, protocol-wide) | `test_compute_route_fee_counter_is_global_across_pairs` |
+| Last-route timestamp | `DataKey::PairLastRouteAt` ← `env.ledger().timestamp()` | `test_compute_route_fee_stamps_pair_last_route_at` |
+| Emitted event | topic `route`, data `(source, destination, amount)` | `test_compute_route_fee_emits_route_event_with_payload` |
 
-`compute_route_fee` acquires the lock after cheap argument validation and
-before any state-dependent reads or effects, and releases it on success.
-A re-entrant inner call (for example via a future malicious token
-callback) therefore observes the lock as held and is rejected with `#14`.
+`quote_route` is the read-only twin and must perform **none** of these. The
+parity guard `test_quote_route_does_not_mutate_counter_or_emit_route_event`
+asserts the counter is unchanged and no new `route` event is emitted after a
+quote.
 
-**Checks-Effects-Interactions.** Guarded entrypoints follow a strict
-ordering:
-
-1. **Checks** — validate all arguments and read-only preconditions.
-2. **Effects** — write state (counter, timestamp) and emit events.
-3. **Interactions** — perform any external token transfer LAST, after all
-   effects are committed.
-
-`compute_route_fee` makes no external calls yet, so the guard is
-preparatory; when the external transfer path lands it must remain the
-final step. The reentrancy guard is the primitive that keeps that path
-safe even if an interacting token re-enters the router.
+The `route_event_payloads` test helper scans the accumulated host events
+(init / register / fee_set all emit too) and returns only the decoded payloads
+of events whose single topic is `route`.
 
 ## License
 
