@@ -1653,3 +1653,99 @@ mod test_i14_pause_gating {
         assert!(!client.is_paused());
     }
 }
+
+/// Issue #15 — min/max amount and liquidity guards in `compute_route_fee`.
+/// Covers at-bound acceptance, below-min (#10), above-max (#11), and
+/// over-liquidity (#12) rejection, the unset sentinels, and negative
+/// liquidity rejection (#6).
+#[cfg(test)]
+mod test_i15_bounds_liquidity {
+    use super::*;
+    use soroban_sdk::{symbol_short, testutils::Address as _};
+
+    /// Register a pair with all auths mocked; returns the client and pair ids.
+    fn setup_pair(env: &Env) -> (StableRouteRouterClient<'_>, Symbol, Symbol) {
+        env.mock_all_auths();
+        let id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(env, &id);
+        client.init(&Address::generate(env));
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        (client, s, d)
+    }
+
+    #[test]
+    fn test_min_amount_at_bound_is_accepted() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_pair_min_amount(&s, &d, &100i128);
+        assert_eq!(client.get_pair_min_amount(&s, &d), 100);
+        // Exactly at the floor is accepted (fee 0, no bps configured).
+        assert_eq!(client.compute_route_fee(&s, &d, &100i128), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn test_below_min_rejected() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_pair_min_amount(&s, &d, &100i128);
+        client.compute_route_fee(&s, &d, &99i128);
+    }
+
+    #[test]
+    fn test_max_amount_at_bound_is_accepted() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_pair_max_amount(&s, &d, &1_000i128);
+        assert_eq!(client.get_pair_max_amount(&s, &d), 1_000);
+        assert_eq!(client.compute_route_fee(&s, &d, &1_000i128), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #11)")]
+    fn test_above_max_rejected() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_pair_max_amount(&s, &d, &1_000i128);
+        client.compute_route_fee(&s, &d, &1_001i128);
+    }
+
+    #[test]
+    fn test_liquidity_at_bound_is_accepted() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_pair_liquidity(&s, &d, &500i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 500);
+        // amount == reported liquidity is allowed.
+        assert_eq!(client.compute_route_fee(&s, &d, &500i128), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #12)")]
+    fn test_above_liquidity_rejected() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_pair_liquidity(&s, &d, &500i128);
+        client.compute_route_fee(&s, &d, &501i128);
+    }
+
+    #[test]
+    fn test_unset_bounds_behave_as_unbounded() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        // Defaults: min 0, max i128::MAX, liquidity unset => unbounded.
+        assert_eq!(client.get_pair_min_amount(&s, &d), 0);
+        assert_eq!(client.get_pair_max_amount(&s, &d), i128::MAX);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
+        assert_eq!(client.compute_route_fee(&s, &d, &1i128), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_set_pair_liquidity_rejects_negative() {
+        let env = Env::default();
+        let (client, s, d) = setup_pair(&env);
+        client.set_pair_liquidity(&s, &d, &-1i128);
+    }
+}
