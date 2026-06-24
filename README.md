@@ -6,6 +6,13 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 
 - **StableRouteRouter** — Soroban contract placeholder for routing metadata and route integrity (version, route tags). Production logic will integrate with path payments and liquidity data.
 
+## Security
+
+See **[`SECURITY.md`](SECURITY.md)** for the router's trust model (single
+admin, two-step transfer, pause), known limitations, and the responsible
+-disclosure process. Report vulnerabilities privately via the StableRoute
+Discord — <https://discord.gg/37aCpusvx> — not as public issues.
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable, with `rustfmt`)
