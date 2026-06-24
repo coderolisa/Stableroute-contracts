@@ -64,6 +64,10 @@ Ensure these pass locally before pushing.
 
 ## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contract conventions (error
+numbering, event-topic limits, admin-auth and pause patterns, storage/TTL
+tiers) and the PR checklist.
+
 1. Fork the repo and create a branch from `main`.
 2. Make changes; keep formatting, linting, tests, WASM build, and coverage passing.
 3. Open a PR; CI must be green.

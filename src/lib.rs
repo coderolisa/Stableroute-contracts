@@ -1,5 +1,7 @@
 #![allow(deprecated)] // TODO: migrate Soroban events to #[contractevent].
 #![no_std]
+// Contributing? See CONTRIBUTING.md for error-numbering, event-topic, auth,
+// pause, and storage/TTL conventions plus the PR checklist.
 
 #[cfg(test)]
 extern crate std;
@@ -575,7 +577,7 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _};
+    use soroban_sdk::{symbol_short, testutils::Address as _, IntoVal};
 
     fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
