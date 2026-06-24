@@ -12,6 +12,9 @@ soroban-sdk = "25.3"
 
 [dev-dependencies]
 soroban-sdk = { version = "25.3", features = ["testutils"] }
+# Property-based testing harness for fee-math invariants (#24). Pinned to
+# the 1.x line; the test config uses a fixed case count for deterministic CI.
+proptest = "1"
 
 [profile.release]
 opt-level = 3

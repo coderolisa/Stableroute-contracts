@@ -49,6 +49,28 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 | `cargo fmt --all` | Format code |
 | `cargo fmt --all -- --check` | CI: verify formatting |
 
+## Property-based fee tests
+
+Beyond the hand-picked example tests, the fee math in `compute_route_fee`
+/ `quote_route` is covered by a [`proptest`](https://docs.rs/proptest)
+harness that asserts invariants across a wide input space:
+
+- `fee <= amount` and `fee >= 0` for any `fee_bps <= MAX_FEE_BPS`;
+- `fee == 0` whenever `fee_bps == 0`;
+- `quote_route` fee equals `compute_route_fee` fee for identical config,
+  and `fee + net == amount`.
+
+Run them with the rest of the suite:
+
+```bash
+cargo test                     # includes the prop_* cases
+cargo test prop_               # property tests only
+```
+
+The harness uses a fixed case count (`ProptestConfig { cases: 96 }`) so CI
+stays deterministic and fast. Add new invariants as further `proptest!`
+blocks in the `mod test` section of [`src/lib.rs`](src/lib.rs).
+
 ## CI/CD
 
 On every push/PR to `main`, GitHub Actions runs:

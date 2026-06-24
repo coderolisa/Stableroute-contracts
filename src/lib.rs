@@ -575,7 +575,79 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _};
+    use proptest::prelude::*;
+    use soroban_sdk::{symbol_short, testutils::Address as _, IntoVal};
+
+    /// Register a USDC→EURC pair with `fee_bps` and unbounded liquidity,
+    /// returning a ready client. Shared by the property tests below.
+    fn setup_pair_with_fee(env: &Env, fee_bps: u32) -> StableRouteRouterClient<'_> {
+        let (client, _admin) = setup_initialized(env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &fee_bps);
+        client
+    }
+
+    proptest! {
+        // Fixed case count keeps CI deterministic and fast.
+        #![proptest_config(ProptestConfig { cases: 96, ..ProptestConfig::default() })]
+
+        /// Invariant: the fee never exceeds the routed amount and is never
+        /// negative, for any valid fee_bps and amount. `amount * fee_bps`
+        /// stays well within i128 (amount < 1e24, fee_bps <= 1000).
+        #[test]
+        fn prop_fee_within_amount(
+            amount in 1i128..1_000_000_000_000_000_000_000_000i128,
+            fee_bps in 0u32..=MAX_FEE_BPS,
+        ) {
+            let env = Env::default();
+            let client = setup_pair_with_fee(&env, fee_bps);
+            let fee = client.compute_route_fee(
+                &symbol_short!("USDC"),
+                &symbol_short!("EURC"),
+                &amount,
+            );
+            prop_assert!(fee >= 0);
+            prop_assert!(fee <= amount);
+        }
+
+        /// Invariant: a zero fee_bps always yields a zero fee.
+        #[test]
+        fn prop_zero_fee_bps_is_free(
+            amount in 1i128..1_000_000_000_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let client = setup_pair_with_fee(&env, 0);
+            let fee = client.compute_route_fee(
+                &symbol_short!("USDC"),
+                &symbol_short!("EURC"),
+                &amount,
+            );
+            prop_assert_eq!(fee, 0);
+        }
+
+        /// Invariant: `quote_route` reports the same fee as
+        /// `compute_route_fee` for identical config, and fee + net == amount.
+        #[test]
+        fn prop_quote_matches_compute(
+            amount in 1i128..1_000_000_000_000_000_000i128,
+            fee_bps in 0u32..=MAX_FEE_BPS,
+        ) {
+            let env = Env::default();
+            let client = setup_pair_with_fee(&env, fee_bps);
+            let (quoted_fee, net) = client.quote_route(
+                &symbol_short!("USDC"),
+                &symbol_short!("EURC"),
+                &amount,
+            );
+            let computed_fee = client.compute_route_fee(
+                &symbol_short!("USDC"),
+                &symbol_short!("EURC"),
+                &amount,
+            );
+            prop_assert_eq!(quoted_fee, computed_fee);
+            prop_assert_eq!(quoted_fee + net, amount);
+        }
+    }
 
     fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
