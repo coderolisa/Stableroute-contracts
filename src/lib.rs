@@ -62,6 +62,10 @@ pub enum DataKey {
     TotalRoutesAllTime,
     /// Ledger timestamp of the most recent `compute_route_fee` for a pair.
     PairLastRouteAt(Symbol, Symbol),
+    /// Minimum number of seconds that must elapse between successive
+    /// `compute_route_fee` calls for a pair. Stored as `u64`; `0` (the
+    /// absent default) disables the rate limit for the pair.
+    PairCooldown(Symbol, Symbol),
     /// On-chain storage schema version. Distinct from version().
     SchemaVersion,
 }
@@ -105,6 +109,9 @@ pub enum RouterError {
     InsufficientLiquidity = 12,
     /// `migrate_v1_to_v2` was called from a non-v1 schema.
     MigrationVersionMismatch = 13,
+    /// `compute_route_fee` was called for a pair again before its
+    /// configured cooldown window elapsed.
+    RouteCooldownActive = 14,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -352,6 +359,33 @@ impl StableRouteRouter {
             .get(&DataKey::PairLastRouteAt(source, destination))
     }
 
+    /// Admin sets the per-pair route cooldown in seconds.
+    ///
+    /// While set to a non-zero value, `compute_route_fee` rejects a call
+    /// for the pair until at least `cooldown_secs` seconds have elapsed
+    /// since the pair's last successful route (`PairLastRouteAt`).
+    /// Setting `0` (the default) disables the rate limit for the pair.
+    pub fn set_pair_cooldown(env: Env, source: Symbol, destination: Symbol, cooldown_secs: u64) {
+        Self::require_admin(&env);
+        env.storage().persistent().set(
+            &DataKey::PairCooldown(source.clone(), destination.clone()),
+            &cooldown_secs,
+        );
+        env.events().publish(
+            (symbol_short!("cd_set"),),
+            (source, destination, cooldown_secs),
+        );
+    }
+
+    /// Read the per-pair route cooldown in seconds (0 when absent,
+    /// meaning the rate limit is disabled for the pair).
+    pub fn get_pair_cooldown(env: Env, source: Symbol, destination: Symbol) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PairCooldown(source, destination))
+            .unwrap_or(0)
+    }
+
     /// Read the protocol-wide lifetime counter of route quotes.
     pub fn get_total_routes_all_time(env: Env) -> u64 {
         env.storage()
@@ -535,6 +569,31 @@ impl StableRouteRouter {
         if amount > liquidity {
             panic_with_error!(&env, RouterError::InsufficientLiquidity);
         }
+        // Per-pair rate limit. A non-zero cooldown forces a minimum gap
+        // between successive routes for the pair. The first route (no
+        // recorded timestamp) is always allowed; cooldown == 0 disables
+        // the check entirely, preserving the prior behaviour. Compare via
+        // addition (last + cooldown) rather than subtraction to avoid any
+        // u64 underflow.
+        let cooldown: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairCooldown(source.clone(), destination.clone()))
+            .unwrap_or(0);
+        if cooldown > 0 {
+            if let Some(last) = env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&DataKey::PairLastRouteAt(
+                    source.clone(),
+                    destination.clone(),
+                ))
+            {
+                if env.ledger().timestamp() < last + cooldown {
+                    panic_with_error!(&env, RouterError::RouteCooldownActive);
+                }
+            }
+        }
         let total: u64 = env
             .storage()
             .persistent()
@@ -575,7 +634,11 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _};
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Ledger as _},
+        IntoVal,
+    };
 
     fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
@@ -1016,5 +1079,81 @@ mod test {
         let contract_id = env.register(StableRouteRouter, ());
         let client = StableRouteRouterClient::new(&env, &contract_id);
         client.pause(); // no admin stored yet
+    }
+
+    // --- per-pair route cooldown rate limit ---
+
+    #[test]
+    fn test_pair_cooldown_get_set_round_trip() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        // Default is disabled (0).
+        assert_eq!(
+            client.get_pair_cooldown(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            0
+        );
+        client.set_pair_cooldown(&symbol_short!("USDC"), &symbol_short!("EURC"), &300u64);
+        assert_eq!(
+            client.get_pair_cooldown(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            300
+        );
+    }
+
+    #[test]
+    fn test_compute_route_fee_cooldown_disabled_allows_repeats() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        // No cooldown configured (default 0): repeated routes at the same
+        // ledger timestamp are all allowed.
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+        assert_eq!(client.get_total_routes_all_time(), 3);
+    }
+
+    #[test]
+    fn test_compute_route_fee_first_route_always_allowed() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_cooldown(&symbol_short!("USDC"), &symbol_short!("EURC"), &100u64);
+        // First route has no recorded last-route timestamp, so the
+        // cooldown cannot block it regardless of the ledger time.
+        env.ledger().set_timestamp(1_000);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+        assert_eq!(client.get_total_routes_all_time(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #14)")]
+    fn test_compute_route_fee_rejects_within_cooldown() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_cooldown(&symbol_short!("USDC"), &symbol_short!("EURC"), &100u64);
+        env.ledger().set_timestamp(1_000);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+        // 1_099 < 1_000 + 100 -> still inside the window -> rejected.
+        env.ledger().set_timestamp(1_099);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+    }
+
+    #[test]
+    fn test_compute_route_fee_allows_at_cooldown_boundary() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_cooldown(&symbol_short!("USDC"), &symbol_short!("EURC"), &100u64);
+        env.ledger().set_timestamp(1_000);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+        // 1_100 == 1_000 + 100 -> boundary is inclusive -> allowed.
+        env.ledger().set_timestamp(1_100);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+        assert_eq!(client.get_total_routes_all_time(), 2);
+        assert_eq!(
+            client.get_pair_last_route_at(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            Some(1_100)
+        );
     }
 }
