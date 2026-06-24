@@ -1814,3 +1814,77 @@ mod test_i16_fee_arithmetic {
         assert_eq!(client.get_total_routes_all_time(), 2);
     }
 }
+
+/// Issue #17 — schema migration path and `get_schema_version` defaults.
+/// Covers the default-of-1, the v1->v2 stamp, the double-migration guard
+/// (#13), the pre-init `NotInitialized` (#2) path, and the admin-auth
+/// requirement.
+#[cfg(test)]
+mod test_i17_migration {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    fn setup(env: &Env) -> StableRouteRouterClient<'_> {
+        env.mock_all_auths();
+        let id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(env, &id);
+        client.init(&Address::generate(env));
+        client
+    }
+
+    #[test]
+    fn test_schema_version_defaults_to_one() {
+        let env = Env::default();
+        let client = setup(&env);
+        assert_eq!(client.get_schema_version(), 1);
+    }
+
+    #[test]
+    fn test_migrate_advances_to_two() {
+        let env = Env::default();
+        let client = setup(&env);
+        client.migrate_v1_to_v2();
+        assert_eq!(client.get_schema_version(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #13)")]
+    fn test_double_migrate_rejected() {
+        let env = Env::default();
+        let client = setup(&env);
+        client.migrate_v1_to_v2();
+        client.migrate_v1_to_v2();
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_migrate_before_init_panics_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(&env, &id);
+        client.migrate_v1_to_v2();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_migrate_requires_admin_auth() {
+        let env = Env::default();
+        let id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        // Authorise only `init`; leave `migrate_v1_to_v2` unauthorised.
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &id,
+                fn_name: "init",
+                args: (admin.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.init(&admin);
+        client.migrate_v1_to_v2();
+    }
+}
