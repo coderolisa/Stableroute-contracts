@@ -62,6 +62,14 @@ pub enum DataKey {
     TotalRoutesAllTime,
     /// Ledger timestamp of the most recent `compute_route_fee` for a pair.
     PairLastRouteAt(Symbol, Symbol),
+    /// Per-pair lifetime counter of `compute_route_fee` invocations.
+    /// Stored as `u64`; incremented with `saturating_add` so it is
+    /// monotonic and never panics on overflow. Absent reads default to 0.
+    PairRouteCount(Symbol, Symbol),
+    /// Per-pair cumulative routed volume (sum of `amount` in source
+    /// units). Stored as `i128`; accumulated with `saturating_add` so it
+    /// is monotonic and never panics on overflow. Absent reads default to 0.
+    PairVolume(Symbol, Symbol),
     /// On-chain storage schema version. Distinct from version().
     SchemaVersion,
 }
@@ -360,6 +368,26 @@ impl StableRouteRouter {
             .unwrap_or(0)
     }
 
+    /// Read the per-pair lifetime count of `compute_route_fee`
+    /// invocations for `(source, destination)`. Returns 0 when the pair
+    /// has never been routed.
+    pub fn get_pair_route_count(env: Env, source: Symbol, destination: Symbol) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PairRouteCount(source, destination))
+            .unwrap_or(0)
+    }
+
+    /// Read the per-pair cumulative routed volume (sum of `amount` in
+    /// source units) for `(source, destination)`. Returns 0 when the
+    /// pair has never been routed.
+    pub fn get_pair_volume(env: Env, source: Symbol, destination: Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PairVolume(source, destination))
+            .unwrap_or(0)
+    }
+
     /// Admin sets the address that receives protocol fees at
     /// settlement time. The router itself never custodies funds.
     pub fn set_fee_recipient(env: Env, recipient: Address) {
@@ -543,6 +571,27 @@ impl StableRouteRouter {
         env.storage()
             .persistent()
             .set(&DataKey::TotalRoutesAllTime, &total.saturating_add(1));
+        let pair_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairRouteCount(
+                source.clone(),
+                destination.clone(),
+            ))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::PairRouteCount(source.clone(), destination.clone()),
+            &pair_count.saturating_add(1),
+        );
+        let pair_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairVolume(source.clone(), destination.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::PairVolume(source.clone(), destination.clone()),
+            &pair_volume.saturating_add(amount),
+        );
         env.storage().persistent().set(
             &DataKey::PairLastRouteAt(source.clone(), destination.clone()),
             &env.ledger().timestamp(),
@@ -575,7 +624,7 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _};
+    use soroban_sdk::{symbol_short, testutils::Address as _, IntoVal};
 
     fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
@@ -1004,6 +1053,80 @@ mod test {
             },
         }]);
         client.pause(); // must panic: admin.require_auth() fails for attacker
+    }
+
+    // --- per-pair route count + cumulative volume tests ---
+
+    #[test]
+    fn test_pair_route_count_and_volume_default_to_zero() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        assert_eq!(
+            client.get_pair_route_count(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            0
+        );
+        assert_eq!(
+            client.get_pair_volume(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            0
+        );
+    }
+
+    #[test]
+    fn test_pair_route_count_and_volume_increment_per_route() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &50u32);
+
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+        assert_eq!(
+            client.get_pair_route_count(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            1
+        );
+        assert_eq!(
+            client.get_pair_volume(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            1_000
+        );
+
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &2_500i128);
+        assert_eq!(
+            client.get_pair_route_count(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            2
+        );
+        assert_eq!(
+            client.get_pair_volume(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            3_500
+        );
+    }
+
+    #[test]
+    fn test_pair_route_count_and_volume_isolated_per_pair() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("GBPC"));
+
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &500i128);
+        client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("GBPC"), &7_000i128);
+
+        assert_eq!(
+            client.get_pair_route_count(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            2
+        );
+        assert_eq!(
+            client.get_pair_volume(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            1_500
+        );
+        assert_eq!(
+            client.get_pair_route_count(&symbol_short!("USDC"), &symbol_short!("GBPC")),
+            1
+        );
+        assert_eq!(
+            client.get_pair_volume(&symbol_short!("USDC"), &symbol_short!("GBPC")),
+            7_000
+        );
     }
 
     /// Calling any admin-gated entrypoint before `init` must panic with

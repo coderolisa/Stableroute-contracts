@@ -6,6 +6,22 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 
 - **StableRouteRouter** — Soroban contract placeholder for routing metadata and route integrity (version, route tags). Production logic will integrate with path payments and liquidity data.
 
+## Per-pair metrics
+
+Each `(source, destination)` pair accumulates lifetime usage metrics that are
+updated whenever `compute_route_fee` succeeds for that pair:
+
+- **Route count** — a `u64` lifetime counter of successful `compute_route_fee`
+  invocations. Read it with `get_pair_route_count(source, destination)`; it
+  defaults to `0` before the pair has ever been routed.
+- **Cumulative volume** — an `i128` running sum of the routed `amount` (in
+  source units). Read it with `get_pair_volume(source, destination)`; it
+  defaults to `0` before the pair has ever been routed.
+
+Both metrics are incremented with saturating arithmetic, so they are monotonic
+and never panic on overflow. They are tracked independently per pair: routing
+one pair never affects another's counters.
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable, with `rustfmt`)
