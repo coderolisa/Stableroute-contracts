@@ -1984,3 +1984,134 @@ mod test_i18_read_surface {
         assert_eq!(client.get_pair_last_route_at(&s, &d), Some(424_242));
     }
 }
+
+/// Issue #19 — negative authorization coverage. The shared `setup_initialized`
+/// uses `mock_all_auths`, so no existing test proves a wrong/missing signer is
+/// rejected. Each test here initialises with a scoped mock authorising only
+/// `init`, then invokes an admin entrypoint with no matching auth and asserts
+/// the call panics. A positive control confirms the call works with auth.
+#[cfg(test)]
+mod test_i19_authorization {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
+    use soroban_sdk::{symbol_short, IntoVal};
+
+    /// Init authorising only the `init` call for `admin`; later privileged
+    /// calls are intentionally left unauthorised.
+    fn setup_scoped(env: &Env) -> StableRouteRouterClient<'_> {
+        let id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(env, &id);
+        let admin = Address::generate(env);
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &id,
+                fn_name: "init",
+                args: (admin.clone(),).into_val(env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.init(&admin);
+        client
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_register_pair_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_unregister_pair_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.unregister_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_pair_fee_bps_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &10u32);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_pair_liquidity_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.set_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC"), &10i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_pair_min_amount_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.set_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &1i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_pair_max_amount_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.set_pair_max_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &1i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_fee_recipient_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.set_fee_recipient(&Address::generate(&env));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_pause_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.pause();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_unpause_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.unpause();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_propose_admin_transfer_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.propose_admin_transfer(&Address::generate(&env));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_migrate_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.migrate_v1_to_v2();
+    }
+
+    /// Positive control: with the admin's auth supplied, the call succeeds.
+    #[test]
+    fn test_admin_can_register_with_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(&env, &id);
+        client.init(&Address::generate(&env));
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+    }
+}
