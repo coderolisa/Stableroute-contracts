@@ -6,21 +6,25 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 
 - **StableRouteRouter** — Soroban contract placeholder for routing metadata and route integrity (version, route tags). Production logic will integrate with path payments and liquidity data.
 
-## Per-pair metrics
+## Route identifiers (`route_tag`)
 
-Each `(source, destination)` pair accumulates lifetime usage metrics that are
-updated whenever `compute_route_fee` succeeds for that pair:
+`route_tag(source, destination)` returns a deterministic 32-byte identifier
+(`BytesN<32>`) for a routing leg, computed on-chain via
+`keccak256(xdr(source) || xdr(destination))`.
 
-- **Route count** — a `u64` lifetime counter of successful `compute_route_fee`
-  invocations. Read it with `get_pair_route_count(source, destination)`; it
-  defaults to `0` before the pair has ever been routed.
-- **Cumulative volume** — an `i128` running sum of the routed `amount` (in
-  source units). Read it with `get_pair_volume(source, destination)`; it
-  defaults to `0` before the pair has ever been routed.
+- **Deterministic** — identical `(source, destination)` inputs always yield the
+  same tag. The off-chain backend can recompute the tag with the same encoding
+  and correlate on-chain routes without persisting a lookup table.
+- **Direction-sensitive** — `source` is hashed before `destination`, so
+  `route_tag(USDC, EURC)` and `route_tag(EURC, USDC)` are different identifiers.
+  Each direction of a pair has its own tag.
+- **Collision-resistant** — keccak256 provides cryptographic collision
+  resistance, so distinct pairs map to distinct tags with overwhelming
+  probability.
 
-Both metrics are incremented with saturating arithmetic, so they are monotonic
-and never panic on overflow. They are tracked independently per pair: routing
-one pair never affects another's counters.
+> Note: `route_tag` previously returned `(Symbol, Symbol)` (an echo of its
+> inputs). It now returns `BytesN<32>`. This is an intentional breaking change
+> to the contract ABI.
 
 ## Prerequisites
 

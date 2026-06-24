@@ -5,8 +5,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
+    xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol,
 };
 
 /// Aggregated read of every pair-scoped storage slot.
@@ -669,10 +669,28 @@ impl StableRouteRouter {
             .unwrap_or(0)
     }
 
-    /// Placeholder: returns a fixed route tag for a source/destination pair.
-    /// Used by the backend to verify route integrity.
-    pub fn route_tag(_env: Env, source: Symbol, destination: Symbol) -> (Symbol, Symbol) {
-        (source, destination)
+    /// Compute a deterministic, direction-sensitive route identifier for a
+    /// `(source, destination)` pair.
+    ///
+    /// The tag is `keccak256(xdr(source) || xdr(destination))`: a stable
+    /// 32-byte digest that depends on the encoded inputs in order. Properties:
+    ///
+    /// - **Deterministic** — the same `(source, destination)` always hashes to
+    ///   the same value, so an off-chain backend can recompute it and correlate
+    ///   on-chain routes without storing a mapping.
+    /// - **Direction-sensitive** — `source` is hashed before `destination`, so
+    ///   `route_tag(USDC, EURC) != route_tag(EURC, USDC)`. Each leg of a pair
+    ///   gets its own identifier.
+    ///
+    /// Returns the digest as a [`BytesN<32>`].
+    pub fn route_tag(env: Env, source: Symbol, destination: Symbol) -> BytesN<32> {
+        // Build the pre-image deterministically: the XDR encoding of `source`
+        // followed by the XDR encoding of `destination`. Ordering the appends
+        // this way is what makes the tag direction-sensitive.
+        let mut buf = Bytes::new(&env);
+        buf.append(&source.to_xdr(&env));
+        buf.append(&destination.to_xdr(&env));
+        env.crypto().keccak256(&buf).to_bytes()
     }
 }
 
@@ -704,9 +722,19 @@ mod test {
         let env = Env::default();
         let contract_id = env.register(StableRouteRouter, ());
         let client = StableRouteRouterClient::new(&env, &contract_id);
-        let (src, dest) = client.route_tag(&symbol_short!("USDC"), &symbol_short!("EURC"));
-        assert_eq!(src, symbol_short!("USDC"));
-        assert_eq!(dest, symbol_short!("EURC"));
+
+        // Determinism: the same inputs hash to the same tag across calls.
+        let tag_a = client.route_tag(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        let tag_b = client.route_tag(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        assert_eq!(tag_a, tag_b);
+
+        // Direction sensitivity: (src, dst) differs from (dst, src).
+        let reversed = client.route_tag(&symbol_short!("EURC"), &symbol_short!("USDC"));
+        assert_ne!(tag_a, reversed);
+
+        // Distinct pairs produce distinct tags.
+        let other = client.route_tag(&symbol_short!("USDC"), &symbol_short!("XLM"));
+        assert_ne!(tag_a, other);
     }
 
     #[test]
