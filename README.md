@@ -49,6 +49,23 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 | `cargo fmt --all` | Format code |
 | `cargo fmt --all -- --check` | CI: verify formatting |
 
+## Roles & least privilege
+
+The router separates **governance** from the **liquidity feed**:
+
+| Role | Set by | Can do | Cannot do |
+|------|--------|--------|-----------|
+| **Admin** | `init` / constructor | Everything: pairs, fees, pause, admin handover, `set_oracle`, liquidity | — |
+| **Oracle** | `set_oracle` (admin only) | `set_pair_liquidity` **only** | Set fees, pause, rotate admin, upgrade, set oracle |
+
+Rationale: the liquidity oracle is a hot, frequently rotated key that
+pushes a low-trust market feed. Forcing it to share the admin key (which
+can redirect fees and rotate control) conflates a low-trust input with
+full governance. `set_pair_liquidity(caller, …)` accepts **either** the
+admin or the configured oracle and rejects everyone else with
+`NotAuthorized` (#14); every other privileged entrypoint remains
+strictly admin-only.
+
 ## CI/CD
 
 On every push/PR to `main`, GitHub Actions runs:

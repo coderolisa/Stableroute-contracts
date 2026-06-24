@@ -64,6 +64,10 @@ pub enum DataKey {
     PairLastRouteAt(Symbol, Symbol),
     /// On-chain storage schema version. Distinct from version().
     SchemaVersion,
+    /// Scoped oracle address allowed to update pair liquidity (and
+    /// nothing else). A least-privilege role so the hot, frequently
+    /// rotated liquidity feed need not hold the full admin key.
+    Oracle,
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -105,6 +109,9 @@ pub enum RouterError {
     InsufficientLiquidity = 12,
     /// `migrate_v1_to_v2` was called from a non-v1 schema.
     MigrationVersionMismatch = 13,
+    /// `set_pair_liquidity` was called by a caller that is neither the
+    /// admin nor the configured oracle.
+    NotAuthorized = 14,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -382,9 +389,47 @@ impl StableRouteRouter {
             .unwrap_or(0)
     }
 
-    /// Admin sets the reported liquidity for a pair (source units).
-    pub fn set_pair_liquidity(env: Env, source: Symbol, destination: Symbol, liquidity: i128) {
+    /// Read the configured liquidity oracle, if any.
+    pub fn get_oracle(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::Oracle)
+    }
+
+    /// Admin sets (or rotates) the scoped liquidity oracle.
+    ///
+    /// Admin-gated. The oracle may update pair liquidity via
+    /// [`Self::set_pair_liquidity`] and **nothing else** — it cannot set
+    /// fees, pause, rotate admin, or upgrade. Emits `oracle_set`.
+    pub fn set_oracle(env: Env, oracle: Address) {
         Self::require_admin(&env);
+        env.storage().persistent().set(&DataKey::Oracle, &oracle);
+        // Topic shortened to satisfy the 9-char `symbol_short!` limit.
+        env.events().publish((symbol_short!("orac_set"),), oracle);
+    }
+
+    /// Set the reported liquidity for a pair (source units).
+    ///
+    /// Dual-authorized: `caller` must be **either** the admin **or** the
+    /// configured oracle, and must `require_auth()`. This implements
+    /// least privilege — the frequently rotated oracle key can keep the
+    /// liquidity feed fresh without holding governance power. Any other
+    /// caller is rejected with [`RouterError::NotAuthorized`].
+    pub fn set_pair_liquidity(
+        env: Env,
+        caller: Address,
+        source: Symbol,
+        destination: Symbol,
+        liquidity: i128,
+    ) {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
+        let oracle: Option<Address> = env.storage().persistent().get(&DataKey::Oracle);
+        if caller != admin && Some(caller.clone()) != oracle {
+            panic_with_error!(&env, RouterError::NotAuthorized);
+        }
         if liquidity < 0 {
             panic_with_error!(&env, RouterError::AmountMustBePositive);
         }
@@ -575,7 +620,7 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _};
+    use soroban_sdk::{symbol_short, testutils::Address as _, IntoVal};
 
     fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
@@ -837,14 +882,19 @@ mod test {
     #[test]
     fn test_pair_limits_liquidity_and_info_round_trip() {
         let env = Env::default();
-        let (client, _admin) = setup_initialized(&env);
+        let (client, admin) = setup_initialized(&env);
         client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
         assert!(!client.is_pair_active(&symbol_short!("USDC"), &symbol_short!("EURC")));
 
         client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &25u32);
         client.set_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &10i128);
         client.set_pair_max_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
-        client.set_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC"), &500i128);
+        client.set_pair_liquidity(
+            &admin,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &500i128,
+        );
 
         assert_eq!(
             client.get_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC")),
@@ -939,9 +989,14 @@ mod test {
     #[should_panic(expected = "Error(Contract, #12)")]
     fn test_compute_route_fee_rejects_insufficient_liquidity() {
         let env = Env::default();
-        let (client, _admin) = setup_initialized(&env);
+        let (client, admin) = setup_initialized(&env);
         client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
-        client.set_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC"), &10i128);
+        client.set_pair_liquidity(
+            &admin,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &10i128,
+        );
         client.compute_route_fee(&symbol_short!("USDC"), &symbol_short!("EURC"), &11i128);
     }
 
@@ -949,8 +1004,98 @@ mod test {
     #[should_panic(expected = "Error(Contract, #6)")]
     fn test_set_pair_liquidity_rejects_negative_value() {
         let env = Env::default();
+        let (client, admin) = setup_initialized(&env);
+        client.set_pair_liquidity(
+            &admin,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &-1i128,
+        );
+    }
+
+    // --- #22: scoped oracle role ---
+
+    /// The oracle (a non-admin) can update pair liquidity.
+    #[test]
+    fn test_oracle_can_update_liquidity() {
+        let env = Env::default();
         let (client, _admin) = setup_initialized(&env);
-        client.set_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC"), &-1i128);
+        let oracle = Address::generate(&env);
+        client.set_oracle(&oracle);
+        assert_eq!(client.get_oracle(), Some(oracle.clone()));
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_liquidity(
+            &oracle,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &777i128,
+        );
+        assert_eq!(
+            client.get_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            777
+        );
+    }
+
+    /// Admin retains the ability to update liquidity directly.
+    #[test]
+    fn test_admin_can_still_update_liquidity() {
+        let env = Env::default();
+        let (client, admin) = setup_initialized(&env);
+        let oracle = Address::generate(&env);
+        client.set_oracle(&oracle);
+        client.set_pair_liquidity(
+            &admin,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &10i128,
+        );
+        assert_eq!(
+            client.get_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            10
+        );
+    }
+
+    /// A caller that is neither admin nor oracle is rejected with
+    /// NotAuthorized (#14).
+    #[test]
+    #[should_panic(expected = "Error(Contract, #14)")]
+    fn test_random_caller_cannot_update_liquidity() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let stranger = Address::generate(&env);
+        client.set_pair_liquidity(
+            &stranger,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &1i128,
+        );
+    }
+
+    /// The oracle role is strictly scoped: the oracle cannot set the
+    /// oracle (an admin-only governance action).
+    #[test]
+    #[should_panic]
+    fn test_oracle_cannot_call_admin_entrypoint() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        env.mock_all_auths();
+        let contract_id = env.register(StableRouteRouter, ());
+        let client = StableRouteRouterClient::new(&env, &contract_id);
+        client.init(&admin);
+        client.set_oracle(&oracle);
+        // Oracle attempts an admin-only action (pause). Authorize only the
+        // oracle so admin.require_auth() must fail.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &oracle,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "pause",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.pause();
     }
 
     #[test]
