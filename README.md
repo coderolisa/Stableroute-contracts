@@ -53,22 +53,21 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 | `cargo fmt --all` | Format code |
 | `cargo fmt --all -- --check` | CI: verify formatting |
 
-## Roles & least privilege
+## Governance timelock
 
-The router separates **governance** from the **liquidity feed**:
+Admin handover can be put behind an optional delay so a compromised admin
+key cannot rotate control in a single ledger with no warning window.
 
-| Role | Set by | Can do | Cannot do |
-|------|--------|--------|-----------|
-| **Admin** | `init` / constructor | Everything: pairs, fees, pause, admin handover, `set_oracle`, liquidity | — |
-| **Oracle** | `set_oracle` (admin only) | `set_pair_liquidity` **only** | Set fees, pause, rotate admin, upgrade, set oracle |
+- `set_timelock(delay_seconds)` (admin) configures the delay. Default `0`
+  means instant handover (prior behaviour).
+- `propose_admin_transfer(new_admin)` stamps `PendingAdminEta = now +
+  delay` and emits a `queued` event carrying `(new_admin, eta)`.
+- `accept_admin_transfer(caller)` rejects with `TimelockNotElapsed` (#14)
+  until `ledger().timestamp() >= eta`, then emits `executed`.
+- `cancel_admin_transfer()` clears both the pending admin and its eta.
 
-Rationale: the liquidity oracle is a hot, frequently rotated key that
-pushes a low-trust market feed. Forcing it to share the admin key (which
-can redirect fees and rotate control) conflates a low-trust input with
-full governance. `set_pair_liquidity(caller, …)` accepts **either** the
-admin or the configured oracle and rejects everyone else with
-`NotAuthorized` (#14); every other privileged entrypoint remains
-strictly admin-only.
+Recommended delay for production governance: **24–72 hours** so users and
+watchers have time to react to a queued handover.
 
 ## CI/CD
 
