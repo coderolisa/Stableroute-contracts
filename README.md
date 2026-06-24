@@ -49,6 +49,20 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 | `cargo fmt --all` | Format code |
 | `cargo fmt --all -- --check` | CI: verify formatting |
 
+## Fee model
+
+A route is charged on two independent bounds — the **tighter wins**:
+
+- **Relative** — `fee = amount * fee_bps / 10_000`, with `fee_bps` capped at
+  `MAX_FEE_BPS` (10%) at write time.
+- **Absolute** — an optional protocol-wide ceiling set via
+  `set_max_fee_absolute` (admin-gated, non-negative). When set, the
+  proportional fee is clamped to it: `min(fee, max_fee_absolute)`. Unset by
+  default (fully backward compatible); a cap of `0` makes every route free.
+
+Both `compute_route_fee` and `quote_route` apply the clamp identically, so a
+quote always matches what a route will charge.
+
 ## CI/CD
 
 On every push/PR to `main`, GitHub Actions runs:
