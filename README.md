@@ -97,16 +97,32 @@ tiers) and the PR checklist.
 
 **`require_admin`** — every admin-gated entrypoint in `StableRouteRouter` calls the private `fn require_admin(env: &Env) -> Address` helper instead of repeating the load-unwrap-require_auth block inline. When adding a new admin-gated entrypoint, start the body with `Self::require_admin(&env);`. Do not duplicate the pattern manually.
 
-### Lifecycle test matrix
+## Slippage protection (minimum-output guard)
 
-The inline test module exercises the contract across two lifecycle states using two helpers:
+`compute_route_fee` returns the fee for routing an amount through a pair and
+computes `net = amount - fee`. Because a route may be submitted into changing
+on-chain conditions (e.g. a fee bump landing between quote and execution), the
+realised `net` can drift below what the caller expected — the kind of value
+leakage that MEV/front-running and ordinary slippage cause.
 
-| Helper | State | Covers |
-|--------|-------|--------|
-| `setup_initialized` | registered + `init` called (admin stored) | happy-path reads/writes, migration, admin transfer, pause/unpause |
-| `setup_uninitialized` | registered, **no** `init` (no admin) | `version()` / `get_schema_version()` defaults; every admin-gated entrypoint panics `NotInitialized` (#2) before any state change |
+`compute_route_fee_checked(source, destination, amount, min_out)` lets the
+caller pin a floor on the output:
 
-`version()` is a fixed identity tag (`ROUTER_V2`) and is asserted to be independent of `get_schema_version()`, which advances 1 -> 2 across `migrate_v1_to_v2`. On an uninitialized contract `get_schema_version()` returns its default of 1.
+- It runs the **same canonical code path** as `compute_route_fee` (identical
+  validation, the same side effects — lifetime counter bump, per-pair
+  last-route-at stamp, and `route` event — and identical fee math), via a
+  shared private inner helper that is invoked exactly once so there is no
+  double counting.
+- After the fee is computed it derives `net = amount - fee`. If
+  `min_out > 0 && net < min_out` it panics with
+  `RouterError::SlippageExceeded` (code `14`).
+- `min_out <= 0` disables the floor, so the call behaves exactly like the
+  unchecked path.
+- On success it returns the fee, identical to `compute_route_fee`.
+
+Off-chain callers that want slippage protection should derive `min_out` from
+their accepted-output tolerance and call the checked variant; callers that
+only need a fee figure can keep using `compute_route_fee`.
 
 ## License
 
