@@ -49,6 +49,29 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 | `cargo fmt --all` | Format code |
 | `cargo fmt --all -- --check` | CI: verify formatting |
 
+## Secure deployment
+
+The admin is set **atomically at deploy time** by the contract
+constructor, which closes the init front-running window (a deployed but
+uninitialized contract whose admin slot anyone could claim).
+
+Deploy with the admin passed as a constructor argument:
+
+```bash
+# Soroban CLI: pass --admin as a constructor arg at deploy
+soroban contract deploy --wasm <router.wasm> -- --admin <ADMIN_G...>
+```
+
+```rust
+// Rust tests / SDK
+let contract_id = env.register(StableRouteRouter, (admin.clone(),));
+```
+
+The legacy `init(admin)` entrypoint is retained for ABI compatibility but
+**always panics with `AlreadyInitialized` (#1)** — the admin slot is
+already populated by the constructor, so `init` can never claim it and an
+attacker can never use it to seize the admin role.
+
 ## CI/CD
 
 On every push/PR to `main`, GitHub Actions runs:

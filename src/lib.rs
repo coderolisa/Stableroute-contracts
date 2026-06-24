@@ -162,19 +162,32 @@ impl StableRouteRouter {
             .set(&DataKey::SchemaVersion, &2u32);
     }
 
-    /// Initialize the router with the operational admin.
+    /// Deploy-time constructor — sets the operational admin **atomically**
+    /// at contract instantiation.
     ///
-    /// Requires `admin.require_auth()` and panics with
-    /// [`RouterError::AlreadyInitialized`] if the admin has already
-    /// been set. Use a redeploy or a future rotation entrypoint to
-    /// change the admin.
-    pub fn init(env: Env, admin: Address) {
-        if env.storage().persistent().has(&DataKey::Admin) {
-            panic_with_error!(&env, RouterError::AlreadyInitialized);
-        }
+    /// Running as the constructor closes the init front-running window:
+    /// the admin slot is written in the same transaction that deploys the
+    /// contract (`register(StableRouteRouter, (admin,))`), so there is no
+    /// observable deployed-but-uninitialized state for an attacker to race
+    /// a separate `init` call into. Requires `admin.require_auth()` and
+    /// emits the `init` event for indexers.
+    pub fn __constructor(env: Env, admin: Address) {
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.events().publish((symbol_short!("init"),), admin);
+    }
+
+    /// Legacy initializer, retained for ABI compatibility only.
+    ///
+    /// The admin is now set by [`Self::__constructor`] at deploy time, so
+    /// the slot is always populated and this entrypoint can never claim
+    /// it. It unconditionally panics with
+    /// [`RouterError::AlreadyInitialized`], preserving the historical
+    /// `#1` semantics for any client still calling `init` post-deploy and
+    /// guaranteeing an attacker can never seize the admin role via `init`.
+    pub fn init(env: Env, admin: Address) {
+        let _ = admin;
+        panic_with_error!(&env, RouterError::AlreadyInitialized);
     }
 
     /// Returns true iff the router is currently paused.
@@ -575,21 +588,24 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _};
+    use soroban_sdk::{symbol_short, testutils::Address as _, IntoVal};
 
+    /// Deploy the router with `admin` set atomically via the constructor
+    /// (`register(StableRouteRouter, (admin,))`) — the front-run-safe path.
     fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
-        let contract_id = env.register(StableRouteRouter, ());
-        let client = StableRouteRouterClient::new(env, &contract_id);
         let admin = Address::generate(env);
-        client.init(&admin);
+        let contract_id = env.register(StableRouteRouter, (admin.clone(),));
+        let client = StableRouteRouterClient::new(env, &contract_id);
         (client, admin)
     }
 
     #[test]
     fn test_version() {
         let env = Env::default();
-        let contract_id = env.register(StableRouteRouter, ());
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(StableRouteRouter, (admin,));
         let client = StableRouteRouterClient::new(&env, &contract_id);
         let v = client.version();
         assert_eq!(v, symbol_short!("ROUTER_V2"));
@@ -598,7 +614,9 @@ mod test {
     #[test]
     fn test_route_tag() {
         let env = Env::default();
-        let contract_id = env.register(StableRouteRouter, ());
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(StableRouteRouter, (admin,));
         let client = StableRouteRouterClient::new(&env, &contract_id);
         let (src, dest) = client.route_tag(&symbol_short!("USDC"), &symbol_short!("EURC"));
         assert_eq!(src, symbol_short!("USDC"));
@@ -978,22 +996,14 @@ mod test {
     #[should_panic]
     fn test_require_admin_rejects_unauthorized_caller() {
         let env = Env::default();
-        let contract_id = env.register(StableRouteRouter, ());
-        let client = StableRouteRouterClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let attacker = Address::generate(&env);
-        // Initialize with the real admin (mock auth only for init).
-        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-            address: &admin,
-            invoke: &soroban_sdk::testutils::MockAuthInvoke {
-                contract: &contract_id,
-                fn_name: "init",
-                args: (admin.clone(),).into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-        client.init(&admin);
-        // Now call pause as the attacker — no mock auth provided for attacker.
+        // Deploy with the real admin set atomically by the constructor.
+        env.mock_all_auths();
+        let contract_id = env.register(StableRouteRouter, (admin.clone(),));
+        let client = StableRouteRouterClient::new(&env, &contract_id);
+        // Now call pause as the attacker — only the attacker is authorized,
+        // so admin.require_auth() inside pause must fail.
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
             address: &attacker,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
@@ -1006,15 +1016,26 @@ mod test {
         client.pause(); // must panic: admin.require_auth() fails for attacker
     }
 
-    /// Calling any admin-gated entrypoint before `init` must panic with
-    /// NotInitialized (error #2).
+    // --- #20: init front-running hardening ---
+
+    /// The constructor sets the admin atomically at deploy time — there is
+    /// no deployed-but-uninitialized window.
     #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_require_admin_panics_when_not_initialized() {
+    fn test_constructor_sets_admin_at_deploy() {
         let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(StableRouteRouter, ());
-        let client = StableRouteRouterClient::new(&env, &contract_id);
-        client.pause(); // no admin stored yet
+        let (client, admin) = setup_initialized(&env);
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    /// An attacker who observes the freshly deployed router cannot seize
+    /// the admin role by calling the legacy `init`: it always rejects with
+    /// AlreadyInitialized (#1) because the slot is already populated.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1)")]
+    fn test_attacker_cannot_seize_admin_via_init() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let attacker = Address::generate(&env);
+        client.init(&attacker);
     }
 }
