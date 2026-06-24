@@ -6,25 +6,9 @@ Soroban smart contracts for [StableRoute](https://github.com/your-org/stablerout
 
 - **StableRouteRouter** — Soroban contract placeholder for routing metadata and route integrity (version, route tags). Production logic will integrate with path payments and liquidity data.
 
-## Route identifiers (`route_tag`)
+## Documentation
 
-`route_tag(source, destination)` returns a deterministic 32-byte identifier
-(`BytesN<32>`) for a routing leg, computed on-chain via
-`keccak256(xdr(source) || xdr(destination))`.
-
-- **Deterministic** — identical `(source, destination)` inputs always yield the
-  same tag. The off-chain backend can recompute the tag with the same encoding
-  and correlate on-chain routes without persisting a lookup table.
-- **Direction-sensitive** — `source` is hashed before `destination`, so
-  `route_tag(USDC, EURC)` and `route_tag(EURC, USDC)` are different identifiers.
-  Each direction of a pair has its own tag.
-- **Collision-resistant** — keccak256 provides cryptographic collision
-  resistance, so distinct pairs map to distinct tags with overwhelming
-  probability.
-
-> Note: `route_tag` previously returned `(Symbol, Symbol)` (an echo of its
-> inputs). It now returns `BytesN<32>`. This is an intentional breaking change
-> to the contract ABI.
+- [Storage Model & DataKey Reference](docs/storage.md) — every `DataKey` with its shape, value type, storage tier, default-when-absent, readers/writers, and TTL class.
 
 ## Prerequisites
 
