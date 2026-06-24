@@ -1067,7 +1067,7 @@ mod test_i18_read_surface {
         client.set_pair_max_amount(&s, &d, &1_000i128);
         client.set_pair_liquidity(&s, &d, &500i128);
         let info = client.get_pair_info(&s, &d);
-        assert_eq!(info.registered, true);
+        assert!(info.registered);
         assert_eq!(info.fee_bps, 25);
         assert_eq!(info.min_amount, 10);
         assert_eq!(info.max_amount, 1_000);
