@@ -80,9 +80,37 @@ in [`src/lib.rs`](src/lib.rs).
 | 11 | `AmountAboveMax` | `compute_route_fee` | Amount is above the pair's configured maximum. |
 | 12 | `InsufficientLiquidity` | `compute_route_fee` | Reported pair liquidity is below the requested amount. |
 | 13 | `MigrationVersionMismatch` | `migrate_v1_to_v2` | Schema is not at v1; migration already applied. |
+| 14 | `TimelockNotElapsed` | `accept_admin_transfer` | Governance timelock delay has not elapsed since `propose_admin_transfer`. Wait until the ETA. |
+| 15 | `ReentrantCall` | `compute_route_fee` | The reentrancy lock was already held (re-entrant invocation). Should not occur in normal use. |
+| 16 | `NotAuthorized` | `set_pair_liquidity` | Caller is neither the admin nor the configured oracle. |
+| 17 | `RouteCooldownActive` | `compute_route_fee` | Called again for the pair before its configured cooldown window elapsed. |
 
 > **Maintainers:** when you append a new `RouterError` variant, add a row
 > here with the next sequential code. Never edit an existing code/row.
+
+### Registration-first invariant
+
+`register_pair` must be called for `(source, destination)` before any of
+its per-pair config setters:
+
+- `set_pair_fee_bps`
+- `set_pair_min_amount`
+- `set_pair_max_amount`
+- `set_pair_liquidity`
+
+Each setter checks `DataKey::Pair(source, destination)` after its own
+admin/sign validation and rejects an unregistered (or since-unregistered)
+pair with `PairNotRegistered` (#5) — the same error `compute_route_fee`
+and `quote_route` already raise. This prevents an admin from writing
+fee/bounds/liquidity config for a corridor that was never enabled, which
+would otherwise waste storage rent and pollute future pair enumeration.
+
+`unregister_pair` does **not** clear the config slots it leaves behind
+(`PairFeeBps`, `PairMinAmount`, `PairMaxAmount`, `PairLiquidity`); a later
+`register_pair` for the same pair silently revives the old values. Whether
+`unregister_pair` should also clear those slots, or refuse to run while
+they're non-default, is a follow-up cleanup question and is out of scope
+for the registration guard above.
 
 ## CI/CD
 
