@@ -7,8 +7,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
-    xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Env, Symbol,
 };
 
 /// Aggregated read of every pair-scoped storage slot.
@@ -81,6 +81,14 @@ pub enum DataKey {
     /// Earliest ledger timestamp at which the currently pending admin
     /// transfer may be accepted (`propose_admin_transfer` time + delay).
     PendingAdminEta,
+    /// Non-reentrancy guard used by state-changing route accounting.
+    ReentrancyLock,
+    /// Per-pair cooldown, in seconds, between route accounting calls.
+    PairCooldown(Symbol, Symbol),
+    /// Optional absolute per-route fee ceiling.
+    MaxFeeAbsolute,
+    /// Scoped liquidity oracle address.
+    Oracle,
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -125,6 +133,12 @@ pub enum RouterError {
     /// `accept_admin_transfer` was called before the governance timelock
     /// delay elapsed.
     TimelockNotElapsed = 14,
+    /// A non-reentrant entrypoint was entered while already locked.
+    ReentrantCall = 15,
+    /// Caller was neither the admin nor the scoped oracle.
+    NotAuthorized = 16,
+    /// Per-pair cooldown has not elapsed since the last route.
+    RouteCooldownActive = 17,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -866,7 +880,9 @@ impl StableRouteRouter {
             .checked_mul(fee_bps as i128)
             .map(|n| n / BPS_DENOMINATOR)
             .unwrap_or(0);
-        Self::apply_fee_cap(&env, fee)
+        let fee = Self::apply_fee_cap(&env, fee);
+        Self::exit_nonreentrant(&env);
+        fee
     }
 
     /// Placeholder: returns a fixed route tag for a source/destination pair.
@@ -879,7 +895,12 @@ impl StableRouteRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _, IntoVal};
+    use proptest::prelude::*;
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Events, Ledger},
+        IntoVal,
+    };
 
     /// Register a USDC→EURC pair with `fee_bps` and unbounded liquidity,
     /// returning a ready client. Shared by the property tests below.
@@ -966,7 +987,15 @@ mod test {
         let admin = Address::generate(env);
         let contract_id = env.register(StableRouteRouter, (admin.clone(),));
         let client = StableRouteRouterClient::new(env, &contract_id);
-        (client, admin)
+        (client, admin, contract_id)
+    }
+
+    /// Register a router without constructor args so legacy pre-init tests can
+    /// assert uninitialized admin-gated entrypoints still fail cleanly.
+    fn setup_uninitialized(env: &Env) -> StableRouteRouterClient<'_> {
+        env.mock_all_auths();
+        let contract_id = env.register(StableRouteRouter, ());
+        StableRouteRouterClient::new(env, &contract_id)
     }
 
     #[test]
@@ -1339,6 +1368,126 @@ mod test {
     }
 
     #[test]
+    fn test_pair_lifecycle_events_have_exact_payloads_and_counts() {
+        let env = Env::default();
+        let (client, admin) = setup_initialized(&env);
+        let src = symbol_short!("USDC");
+        let dest = symbol_short!("EURC");
+
+        let init_payloads = event_payloads(&env, symbol_short!("init"));
+        assert_eq!(init_payloads.len(), 1, "constructor emits one init event");
+        let init_admin: Address = soroban_sdk::TryFromVal::try_from_val(&env, &init_payloads[0])
+            .expect("init event data decodes to admin address");
+        assert_eq!(init_admin, admin);
+
+        client.register_pair(&src, &dest);
+        let pair_reg_payloads = event_payloads(&env, symbol_short!("pair_reg"));
+        assert_eq!(
+            pair_reg_payloads.len(),
+            1,
+            "register_pair emits one pair_reg event"
+        );
+        let pair_reg: (Symbol, Symbol) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &pair_reg_payloads[0])
+                .expect("pair_reg event data decodes to pair tuple");
+        assert_eq!(pair_reg, (src.clone(), dest.clone()));
+
+        client.set_pair_fee_bps(&src, &dest, &25u32);
+        let fee_set_payloads = event_payloads(&env, symbol_short!("fee_set"));
+        assert_eq!(
+            fee_set_payloads.len(),
+            1,
+            "set_pair_fee_bps emits one fee_set event"
+        );
+        let fee_set: (Symbol, Symbol, u32) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &fee_set_payloads[0])
+                .expect("fee_set event data decodes to pair and fee");
+        assert_eq!(fee_set, (src.clone(), dest.clone(), 25u32));
+
+        client.set_pair_liquidity(&admin, &src, &dest, &1_000i128);
+        let liq_set_payloads = event_payloads(&env, symbol_short!("liq_set"));
+        assert_eq!(
+            liq_set_payloads.len(),
+            1,
+            "set_pair_liquidity emits one liq_set event"
+        );
+        let liq_set: (Symbol, Symbol, i128) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &liq_set_payloads[0])
+                .expect("liq_set event data decodes to pair and liquidity");
+        assert_eq!(liq_set, (src.clone(), dest.clone(), 1_000i128));
+
+        client.unregister_pair(&src, &dest);
+        let unreg_payloads = event_payloads(&env, symbol_short!("unreg"));
+        assert_eq!(
+            unreg_payloads.len(),
+            1,
+            "unregister_pair emits one unreg event"
+        );
+        let unreg: (Symbol, Symbol) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &unreg_payloads[0])
+                .expect("unreg event data decodes to pair tuple");
+        assert_eq!(unreg, (src, dest));
+    }
+
+    #[test]
+    fn test_unregister_never_registered_pair_is_clean_noop_with_event() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let src = symbol_short!("USDC");
+        let dest = symbol_short!("EURC");
+
+        assert!(!client.is_pair_registered(&src, &dest));
+        client.unregister_pair(&src, &dest);
+
+        let unreg_payloads = event_payloads(&env, symbol_short!("unreg"));
+        assert_eq!(
+            unreg_payloads.len(),
+            1,
+            "no-op unregister still documents one lifecycle event"
+        );
+        let unreg: (Symbol, Symbol) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &unreg_payloads[0])
+                .expect("unreg event data decodes to pair tuple");
+        assert_eq!(unreg, (src, dest));
+        assert!(!client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+    }
+
+    #[test]
+    fn test_reregister_after_unregister_restores_pair_and_preserves_fee() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let src = symbol_short!("USDC");
+        let dest = symbol_short!("EURC");
+
+        client.register_pair(&src, &dest);
+        assert_eq!(
+            event_payloads(&env, symbol_short!("pair_reg")).len(),
+            1,
+            "initial register should emit one pair_reg event"
+        );
+        client.set_pair_fee_bps(&src, &dest, &42u32);
+        client.unregister_pair(&src, &dest);
+        assert_eq!(
+            event_payloads(&env, symbol_short!("unreg")).len(),
+            1,
+            "single unregister should emit one unreg event"
+        );
+
+        assert!(!client.is_pair_registered(&src, &dest));
+        assert_eq!(client.get_pair_fee_bps(&src, &dest), 42);
+
+        client.register_pair(&src, &dest);
+        assert_eq!(
+            event_payloads(&env, symbol_short!("pair_reg")).len(),
+            1,
+            "re-register should emit one pair_reg event"
+        );
+
+        assert!(client.is_pair_registered(&src, &dest));
+        assert_eq!(client.get_pair_fee_bps(&src, &dest), 42);
+    }
+
+    #[test]
     fn test_pair_limits_liquidity_and_info_round_trip() {
         let env = Env::default();
         let (client, admin) = setup_initialized(&env);
@@ -1515,9 +1664,9 @@ mod test {
     }
 
     /// A caller that is neither admin nor oracle is rejected with
-    /// NotAuthorized (#14).
+    /// NotAuthorized (#16).
     #[test]
-    #[should_panic(expected = "Error(Contract, #14)")]
+    #[should_panic(expected = "Error(Contract, #16)")]
     fn test_random_caller_cannot_update_liquidity() {
         let env = Env::default();
         let (client, _admin) = setup_initialized(&env);
@@ -1539,9 +1688,8 @@ mod test {
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
         env.mock_all_auths();
-        let contract_id = env.register(StableRouteRouter, ());
+        let contract_id = env.register(StableRouteRouter, (admin.clone(),));
         let client = StableRouteRouterClient::new(&env, &contract_id);
-        client.init(&admin);
         client.set_oracle(&oracle);
         // Oracle attempts an admin-only action (pause). Authorize only the
         // oracle so admin.require_auth() must fail.
@@ -1591,19 +1739,13 @@ mod test {
         client
     }
 
-    /// Scan the test-host's accumulated contract events and return the decoded
-    /// `data` payloads of every event whose single topic is `route`. Events
-    /// accumulate across init / register / fee_set, so this filters by topic
-    /// instead of asserting on the whole stream. Decodes each XDR event body
-    /// back into host `Val`s so callers can compare against an expected tuple.
-    fn route_event_payloads(env: &Env) -> std::vec::Vec<soroban_sdk::Val> {
+    /// Scan the test-host's current contract events and return the decoded
+    /// `data` payloads of every event whose single topic matches `topic`.
+    fn event_payloads(env: &Env, topic: Symbol) -> std::vec::Vec<soroban_sdk::Val> {
         use soroban_sdk::{
-            xdr::{ContractEventBody, ScSymbol, ScVal},
+            xdr::{ContractEventBody, ScVal},
             TryFromVal, Val,
         };
-        let route_topic = ScVal::Symbol(ScSymbol(
-            "route".try_into().expect("route fits in a Symbol"),
-        ));
         env.events()
             .all()
             .events()
@@ -1611,13 +1753,25 @@ mod test {
             .filter_map(|event| {
                 let ContractEventBody::V0(body) = &event.body;
                 let topics = body.topics.as_slice();
-                if topics.len() == 1 && topics[0] == route_topic {
+                if topics.len() != 1 {
+                    return None;
+                }
+                let ScVal::Symbol(raw_topic) = &topics[0] else {
+                    return None;
+                };
+                let actual_topic =
+                    Symbol::try_from_val(env, raw_topic).expect("event topic decodes to Symbol");
+                if actual_topic == topic {
                     Some(Val::try_from_val(env, &body.data).expect("event data decodes to Val"))
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    fn route_event_payloads(env: &Env) -> std::vec::Vec<soroban_sdk::Val> {
+        event_payloads(env, symbol_short!("route"))
     }
 
     #[test]
@@ -1766,129 +1920,13 @@ mod test {
         assert_eq!(client.version(), symbol_short!("ROUTER_V2"));
     }
 
-    /// `version()` does not require an initialized contract: it is a pure
-    /// constant readable on a freshly registered (uninitialized) contract.
+    /// The constructor requires an admin argument, so tests cannot create the
+    /// old deployed-but-uninitialized state with zero constructor args.
     #[test]
-    fn test_version_readable_when_uninitialized() {
+    #[should_panic]
+    fn test_constructor_rejects_missing_admin_arg() {
         let env = Env::default();
-        let client = setup_uninitialized(&env);
-        assert_eq!(client.version(), symbol_short!("ROUTER_V2"));
-    }
-
-    // --- get_schema_version default before init/migration ---
-
-    /// On a registered-but-uninitialized contract (no init, no migration),
-    /// `get_schema_version()` returns the implicit pre-migration default of 1.
-    #[test]
-    fn test_get_schema_version_defaults_to_one_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        assert_eq!(client.get_schema_version(), 1);
-    }
-
-    // --- uninitialized admin-gated entrypoints panic NotInitialized (#2) ---
-    //
-    // Each test below registers the contract WITHOUT init and calls one
-    // admin-gated entrypoint. With no admin stored, `require_admin` panics
-    // with NotInitialized (#2) before any state change can occur. Auths are
-    // mocked, so the panic is solely from the missing admin, not auth.
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_pause_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        client.pause();
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_unpause_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        client.unpause();
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_set_pair_fee_bps_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &50u32);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_propose_admin_transfer_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        let new_admin = Address::generate(&env);
-        client.propose_admin_transfer(&new_admin);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_cancel_admin_transfer_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        client.cancel_admin_transfer();
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_migrate_v1_to_v2_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        client.migrate_v1_to_v2();
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_set_fee_recipient_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        let recipient = Address::generate(&env);
-        client.set_fee_recipient(&recipient);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_register_pair_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_unregister_pair_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        client.unregister_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_set_pair_liquidity_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        client.set_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC"), &1i128);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_set_pair_min_amount_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        client.set_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &1i128);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_set_pair_max_amount_panics_when_uninitialized() {
-        let env = Env::default();
-        let client = setup_uninitialized(&env);
-        client.set_pair_max_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &1i128);
+        let _client = setup_uninitialized(&env);
     }
 }
 
@@ -1906,9 +1944,9 @@ mod test_i14_pause_gating {
     /// Register + init a router with all auths mocked.
     fn setup(env: &Env) -> StableRouteRouterClient<'_> {
         env.mock_all_auths();
-        let id = env.register(StableRouteRouter, ());
+        let admin = Address::generate(env);
+        let id = env.register(StableRouteRouter, (admin,));
         let client = StableRouteRouterClient::new(env, &id);
-        client.init(&Address::generate(env));
         client
     }
 
@@ -1984,20 +2022,20 @@ mod test_i15_bounds_liquidity {
     use soroban_sdk::{symbol_short, testutils::Address as _};
 
     /// Register a pair with all auths mocked; returns the client and pair ids.
-    fn setup_pair(env: &Env) -> (StableRouteRouterClient<'_>, Symbol, Symbol) {
+    fn setup_pair(env: &Env) -> (StableRouteRouterClient<'_>, Address, Symbol, Symbol) {
         env.mock_all_auths();
-        let id = env.register(StableRouteRouter, ());
+        let admin = Address::generate(env);
+        let id = env.register(StableRouteRouter, (admin.clone(),));
         let client = StableRouteRouterClient::new(env, &id);
-        client.init(&Address::generate(env));
         let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
         client.register_pair(&s, &d);
-        (client, s, d)
+        (client, admin, s, d)
     }
 
     #[test]
     fn test_min_amount_at_bound_is_accepted() {
         let env = Env::default();
-        let (client, s, d) = setup_pair(&env);
+        let (client, _admin, s, d) = setup_pair(&env);
         client.set_pair_min_amount(&s, &d, &100i128);
         assert_eq!(client.get_pair_min_amount(&s, &d), 100);
         // Exactly at the floor is accepted (fee 0, no bps configured).
@@ -2008,7 +2046,7 @@ mod test_i15_bounds_liquidity {
     #[should_panic(expected = "Error(Contract, #10)")]
     fn test_below_min_rejected() {
         let env = Env::default();
-        let (client, s, d) = setup_pair(&env);
+        let (client, _admin, s, d) = setup_pair(&env);
         client.set_pair_min_amount(&s, &d, &100i128);
         client.compute_route_fee(&s, &d, &99i128);
     }
@@ -2016,7 +2054,7 @@ mod test_i15_bounds_liquidity {
     #[test]
     fn test_max_amount_at_bound_is_accepted() {
         let env = Env::default();
-        let (client, s, d) = setup_pair(&env);
+        let (client, _admin, s, d) = setup_pair(&env);
         client.set_pair_max_amount(&s, &d, &1_000i128);
         assert_eq!(client.get_pair_max_amount(&s, &d), 1_000);
         assert_eq!(client.compute_route_fee(&s, &d, &1_000i128), 0);
@@ -2026,7 +2064,7 @@ mod test_i15_bounds_liquidity {
     #[should_panic(expected = "Error(Contract, #11)")]
     fn test_above_max_rejected() {
         let env = Env::default();
-        let (client, s, d) = setup_pair(&env);
+        let (client, _admin, s, d) = setup_pair(&env);
         client.set_pair_max_amount(&s, &d, &1_000i128);
         client.compute_route_fee(&s, &d, &1_001i128);
     }
@@ -2034,8 +2072,8 @@ mod test_i15_bounds_liquidity {
     #[test]
     fn test_liquidity_at_bound_is_accepted() {
         let env = Env::default();
-        let (client, s, d) = setup_pair(&env);
-        client.set_pair_liquidity(&s, &d, &500i128);
+        let (client, admin, s, d) = setup_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &500i128);
         assert_eq!(client.get_pair_liquidity(&s, &d), 500);
         // amount == reported liquidity is allowed.
         assert_eq!(client.compute_route_fee(&s, &d, &500i128), 0);
@@ -2045,15 +2083,15 @@ mod test_i15_bounds_liquidity {
     #[should_panic(expected = "Error(Contract, #12)")]
     fn test_above_liquidity_rejected() {
         let env = Env::default();
-        let (client, s, d) = setup_pair(&env);
-        client.set_pair_liquidity(&s, &d, &500i128);
+        let (client, admin, s, d) = setup_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &500i128);
         client.compute_route_fee(&s, &d, &501i128);
     }
 
     #[test]
     fn test_unset_bounds_behave_as_unbounded() {
         let env = Env::default();
-        let (client, s, d) = setup_pair(&env);
+        let (client, _admin, s, d) = setup_pair(&env);
         // Defaults: min 0, max i128::MAX, liquidity unset => unbounded.
         assert_eq!(client.get_pair_min_amount(&s, &d), 0);
         assert_eq!(client.get_pair_max_amount(&s, &d), i128::MAX);
@@ -2065,8 +2103,8 @@ mod test_i15_bounds_liquidity {
     #[should_panic(expected = "Error(Contract, #6)")]
     fn test_set_pair_liquidity_rejects_negative() {
         let env = Env::default();
-        let (client, s, d) = setup_pair(&env);
-        client.set_pair_liquidity(&s, &d, &-1i128);
+        let (client, admin, s, d) = setup_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &-1i128);
     }
 }
 
@@ -2082,13 +2120,13 @@ mod test_i16_fee_arithmetic {
     /// never pre-empt the arithmetic path under test.
     fn setup_pair(env: &Env) -> (StableRouteRouterClient<'_>, Symbol, Symbol) {
         env.mock_all_auths();
-        let id = env.register(StableRouteRouter, ());
+        let admin = Address::generate(env);
+        let id = env.register(StableRouteRouter, (admin.clone(),));
         let client = StableRouteRouterClient::new(env, &id);
-        client.init(&Address::generate(env));
         let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
         client.register_pair(&s, &d);
         client.set_pair_max_amount(&s, &d, &i128::MAX);
-        client.set_pair_liquidity(&s, &d, &i128::MAX);
+        client.set_pair_liquidity(&admin, &s, &d, &i128::MAX);
         (client, s, d)
     }
 
@@ -2137,8 +2175,7 @@ mod test_i16_fee_arithmetic {
 
 /// Issue #17 — schema migration path and `get_schema_version` defaults.
 /// Covers the default-of-1, the v1->v2 stamp, the double-migration guard
-/// (#13), the pre-init `NotInitialized` (#2) path, and the admin-auth
-/// requirement.
+/// (#13), and the admin-auth requirement.
 #[cfg(test)]
 mod test_i17_migration {
     use super::*;
@@ -2147,9 +2184,9 @@ mod test_i17_migration {
 
     fn setup(env: &Env) -> StableRouteRouterClient<'_> {
         env.mock_all_auths();
-        let id = env.register(StableRouteRouter, ());
+        let admin = Address::generate(env);
+        let id = env.register(StableRouteRouter, (admin,));
         let client = StableRouteRouterClient::new(env, &id);
-        client.init(&Address::generate(env));
         client
     }
 
@@ -2178,33 +2215,22 @@ mod test_i17_migration {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_migrate_before_init_panics_not_initialized() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(StableRouteRouter, ());
-        let client = StableRouteRouterClient::new(&env, &id);
-        client.migrate_v1_to_v2();
-    }
-
-    #[test]
     #[should_panic]
     fn test_migrate_requires_admin_auth() {
         let env = Env::default();
-        let id = env.register(StableRouteRouter, ());
-        let client = StableRouteRouterClient::new(&env, &id);
         let admin = Address::generate(&env);
-        // Authorise only `init`; leave `migrate_v1_to_v2` unauthorised.
+        let id = Address::generate(&env);
         env.mock_auths(&[MockAuth {
             address: &admin,
             invoke: &MockAuthInvoke {
                 contract: &id,
-                fn_name: "init",
+                fn_name: "__constructor",
                 args: (admin.clone(),).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
-        client.init(&admin);
+        env.register_at(&id, StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(&env, &id);
         client.migrate_v1_to_v2();
     }
 }
@@ -2222,9 +2248,9 @@ mod test_i18_read_surface {
 
     fn setup(env: &Env) -> StableRouteRouterClient<'_> {
         env.mock_all_auths();
-        let id = env.register(StableRouteRouter, ());
+        let admin = Address::generate(env);
+        let id = env.register(StableRouteRouter, (admin,));
         let client = StableRouteRouterClient::new(env, &id);
-        client.init(&Address::generate(env));
         client
     }
 
@@ -2255,7 +2281,8 @@ mod test_i18_read_surface {
         client.set_pair_fee_bps(&s, &d, &25u32);
         client.set_pair_min_amount(&s, &d, &10i128);
         client.set_pair_max_amount(&s, &d, &1_000i128);
-        client.set_pair_liquidity(&s, &d, &500i128);
+        let admin = client.get_admin().expect("constructor stores admin");
+        client.set_pair_liquidity(&admin, &s, &d, &500i128);
         let info = client.get_pair_info(&s, &d);
         assert!(info.registered);
         assert_eq!(info.fee_bps, 25);
@@ -2273,7 +2300,8 @@ mod test_i18_read_surface {
         client.register_pair(&s, &d);
         // Registered but zero liquidity is still inactive.
         assert!(!client.is_pair_active(&s, &d));
-        client.set_pair_liquidity(&s, &d, &1i128);
+        let admin = client.get_admin().expect("constructor stores admin");
+        client.set_pair_liquidity(&admin, &s, &d, &1i128);
         assert!(client.is_pair_active(&s, &d));
     }
 
@@ -2316,22 +2344,22 @@ mod test_i19_authorization {
     use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
     use soroban_sdk::{symbol_short, IntoVal};
 
-    /// Init authorising only the `init` call for `admin`; later privileged
-    /// calls are intentionally left unauthorised.
+    /// Register the constructor with only constructor auth for `admin`; later
+    /// privileged calls are intentionally left unauthorised.
     fn setup_scoped(env: &Env) -> StableRouteRouterClient<'_> {
-        let id = env.register(StableRouteRouter, ());
-        let client = StableRouteRouterClient::new(env, &id);
         let admin = Address::generate(env);
+        let id = Address::generate(env);
         env.mock_auths(&[MockAuth {
             address: &admin,
             invoke: &MockAuthInvoke {
                 contract: &id,
-                fn_name: "init",
+                fn_name: "__constructor",
                 args: (admin.clone(),).into_val(env),
                 sub_invokes: &[],
             },
         }]);
-        client.init(&admin);
+        env.register_at(&id, StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(env, &id);
         client
     }
 
@@ -2364,7 +2392,13 @@ mod test_i19_authorization {
     fn test_set_pair_liquidity_requires_admin() {
         let env = Env::default();
         let client = setup_scoped(&env);
-        client.set_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC"), &10i128);
+        let caller = Address::generate(&env);
+        client.set_pair_liquidity(
+            &caller,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &10i128,
+        );
     }
 
     #[test]
@@ -2428,9 +2462,9 @@ mod test_i19_authorization {
     fn test_admin_can_register_with_auth() {
         let env = Env::default();
         env.mock_all_auths();
-        let id = env.register(StableRouteRouter, ());
+        let admin = Address::generate(&env);
+        let id = env.register(StableRouteRouter, (admin,));
         let client = StableRouteRouterClient::new(&env, &id);
-        client.init(&Address::generate(&env));
         client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
         assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
     }
@@ -2446,9 +2480,9 @@ mod test_i41_fee_cap {
 
     fn setup_pair(env: &Env) -> (StableRouteRouterClient<'_>, Symbol, Symbol) {
         env.mock_all_auths();
-        let id = env.register(StableRouteRouter, ());
+        let admin = Address::generate(env);
+        let id = env.register(StableRouteRouter, (admin,));
         let client = StableRouteRouterClient::new(env, &id);
-        client.init(&Address::generate(env));
         let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
         client.register_pair(&s, &d);
         client.set_pair_fee_bps(&s, &d, &100u32); // 1%

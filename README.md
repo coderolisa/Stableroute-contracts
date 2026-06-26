@@ -80,6 +80,10 @@ in [`src/lib.rs`](src/lib.rs).
 | 11 | `AmountAboveMax` | `compute_route_fee` | Amount is above the pair's configured maximum. |
 | 12 | `InsufficientLiquidity` | `compute_route_fee` | Reported pair liquidity is below the requested amount. |
 | 13 | `MigrationVersionMismatch` | `migrate_v1_to_v2` | Schema is not at v1; migration already applied. |
+| 14 | `TimelockNotElapsed` | `accept_admin_transfer` | Governance timelock has not elapsed yet; retry after the queued ETA. |
+| 15 | `ReentrantCall` | `compute_route_fee` | Route accounting was re-entered while locked; retry only after the first call completes. |
+| 16 | `NotAuthorized` | `set_pair_liquidity` | Caller is neither the admin nor the configured oracle. |
+| 17 | `RouteCooldownActive` | `compute_route_fee` | Pair cooldown has not elapsed since the previous routed amount. |
 
 > **Maintainers:** when you append a new `RouterError` variant, add a row
 > here with the next sequential code. Never edit an existing code/row.
@@ -130,9 +134,27 @@ parity guard `test_quote_route_does_not_mutate_counter_or_emit_route_event`
 asserts the counter is unchanged and no new `route` event is emitted after a
 quote.
 
-The `route_event_payloads` test helper scans the accumulated host events
-(init / register / fee_set all emit too) and returns only the decoded payloads
-of events whose single topic is `route`.
+The `route_event_payloads` test helper scans the current host event buffer and
+returns only the decoded payloads of events whose single topic is `route`.
+
+### Pair lifecycle event and idempotency matrix
+
+Pair lifecycle tests assert the exact one-event payload emitted by each
+lifecycle entrypoint before any later contract call refreshes the host event
+buffer:
+
+| Entrypoint | Topic | Data payload | Test |
+|------------|-------|--------------|------|
+| constructor | `init` | `admin` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+| `register_pair` | `pair_reg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+| `set_pair_fee_bps` | `fee_set` | `(source, destination, fee_bps)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+| `set_pair_liquidity` | `liq_set` | `(source, destination, liquidity)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+| `unregister_pair` | `unreg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+
+Two edge-case tests guard idempotency and storage boundaries: unregistering a
+never-registered pair stays a clean no-op while still emitting the lifecycle
+event, and re-registering after unregister restores the pair without clearing
+the stored `PairFeeBps` value.
 
 ## License
 
