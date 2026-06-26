@@ -2168,6 +2168,206 @@ mod test {
         let env = Env::default();
         let _client = setup_uninitialized(&env);
     }
+
+    // --- liquidity consumption model ---
+
+    fn liq_used_event_payloads(env: &Env) -> std::vec::Vec<soroban_sdk::Val> {
+        event_payloads(env, symbol_short!("liq_used"))
+    }
+
+    fn setup_liquidity_pair(env: &Env) -> (StableRouteRouterClient<'_>, Address, Symbol, Symbol) {
+        let (client, admin) = setup_initialized(env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &50u32);
+        (client, admin, s, d)
+    }
+
+    #[test]
+    fn test_liquidity_decremented_by_amount_after_route() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 1_000);
+
+        let _fee = client.compute_route_fee(&s, &d, &300i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 700);
+    }
+
+    #[test]
+    fn test_exact_liquidity_route_consumes_all() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &500i128);
+
+        let _fee = client.compute_route_fee(&s, &d, &500i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
+    }
+
+    #[test]
+    fn test_repeated_routes_exhaust_liquidity() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &100i128);
+
+        client.compute_route_fee(&s, &d, &40i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 60);
+
+        client.compute_route_fee(&s, &d, &30i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 30);
+
+        client.compute_route_fee(&s, &d, &30i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
+
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.compute_route_fee(&s, &d, &1i128)
+        }));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_insufficient_liquidity_after_partial_consume() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &100i128);
+
+        client.compute_route_fee(&s, &d, &60i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 40);
+
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.compute_route_fee(&s, &d, &50i128)
+        }));
+        assert!(err.is_err());
+        assert_eq!(client.get_pair_liquidity(&s, &d), 40);
+    }
+
+    #[test]
+    fn test_unset_liquidity_stays_unbounded() {
+        let env = Env::default();
+        let (client, _admin, s, d) = setup_liquidity_pair(&env);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
+        let _fee = client.compute_route_fee(&s, &d, &1_000_000i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
+        assert_eq!(liq_used_event_payloads(&env).len(), 0);
+    }
+
+    #[test]
+    fn test_liq_used_event_emitted_with_remaining() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
+
+        client.compute_route_fee(&s, &d, &300i128);
+
+        let payloads = liq_used_event_payloads(&env);
+        assert_eq!(payloads.len(), 1);
+        let decoded: (Symbol, Symbol, i128) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+                .expect("liq_used data decodes to (Symbol, Symbol, i128)");
+        assert_eq!(decoded, (s, d, 700i128));
+    }
+
+    #[test]
+    fn test_oracle_top_up_after_consumption() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &500i128);
+
+        client.compute_route_fee(&s, &d, &300i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 200);
+
+        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 1_000);
+
+        let _fee = client.compute_route_fee(&s, &d, &800i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 200);
+    }
+
+    #[test]
+    fn test_zero_liquidity_after_drain_allows_top_up() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &100i128);
+
+        client.compute_route_fee(&s, &d, &100i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
+
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.compute_route_fee(&s, &d, &1i128)
+        }));
+        assert!(err.is_err());
+
+        client.set_pair_liquidity(&admin, &s, &d, &50i128);
+        let _fee = client.compute_route_fee(&s, &d, &50i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
+    }
+
+    #[test]
+    fn test_liq_used_event_not_emitted_for_unset() {
+        let env = Env::default();
+        let (client, _admin, s, d) = setup_liquidity_pair(&env);
+
+        let _fee = client.compute_route_fee(&s, &d, &999_999i128);
+
+        assert_eq!(liq_used_event_payloads(&env).len(), 0);
+    }
+
+    #[test]
+    fn test_liq_used_and_route_both_emitted() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &500i128);
+
+        client.compute_route_fee(&s, &d, &200i128);
+
+        let liq_payloads = liq_used_event_payloads(&env);
+        assert_eq!(liq_payloads.len(), 1);
+        let liq_used: (Symbol, Symbol, i128) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &liq_payloads[0])
+                .expect("liq_used data decodes");
+        assert_eq!(liq_used, (s.clone(), d.clone(), 300i128));
+
+        let route_payloads = route_event_payloads(&env);
+        assert_eq!(route_payloads.len(), 1);
+        let route: (Symbol, Symbol, i128) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &route_payloads[0])
+                .expect("route data decodes");
+        assert_eq!(route, (s, d, 200i128));
+    }
+
+    #[test]
+    fn test_multiple_pairs_independent_liquidity() {
+        let env = Env::default();
+        let (client, admin) = setup_initialized(&env);
+        let a_src = symbol_short!("USDC");
+        let a_dst = symbol_short!("EURC");
+        let b_src = symbol_short!("XLM");
+        let b_dst = symbol_short!("USDC");
+        client.register_pair(&a_src, &a_dst);
+        client.register_pair(&b_src, &b_dst);
+        client.set_pair_fee_bps(&a_src, &a_dst, &10u32);
+        client.set_pair_fee_bps(&b_src, &b_dst, &10u32);
+        client.set_pair_liquidity(&admin, &a_src, &a_dst, &500i128);
+        client.set_pair_liquidity(&admin, &b_src, &b_dst, &300i128);
+
+        client.compute_route_fee(&a_src, &a_dst, &200i128);
+        assert_eq!(client.get_pair_liquidity(&a_src, &a_dst), 300);
+        assert_eq!(client.get_pair_liquidity(&b_src, &b_dst), 300);
+
+        client.compute_route_fee(&b_src, &b_dst, &100i128);
+        assert_eq!(client.get_pair_liquidity(&a_src, &a_dst), 300);
+        assert_eq!(client.get_pair_liquidity(&b_src, &b_dst), 200);
+    }
+
+    #[test]
+    fn test_saturating_sub_never_underflows() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &1i128);
+
+        let _fee = client.compute_route_fee(&s, &d, &1i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
+    }
 }
 
 /// Registration-before-configuration guard. `set_pair_fee_bps`,
@@ -2626,7 +2826,7 @@ mod test_i17_migration {
         let admin = Address::generate(&env);
         let id = Address::generate(&env);
         env.mock_auths(&[MockAuth {
-            address: &stranger,
+            address: &admin,
             invoke: &MockAuthInvoke {
                 contract: &id,
                 fn_name: "__constructor",
@@ -2654,9 +2854,9 @@ mod test_i18_read_surface {
     fn setup(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
         let admin = Address::generate(env);
-        let id = env.register(StableRouteRouter, (admin,));
+        let id = env.register(StableRouteRouter, (admin.clone(),));
         let client = StableRouteRouterClient::new(env, &id);
-        client
+        (client, admin)
     }
 
     #[test]
@@ -2746,7 +2946,11 @@ mod test_i18_read_surface {
 #[cfg(test)]
 mod test_i19_authorization {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _};
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, MockAuth, MockAuthInvoke},
+        IntoVal,
+    };
 
     /// Register the constructor with only constructor auth for `admin`; later
     /// privileged calls are intentionally left unauthorised.
