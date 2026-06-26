@@ -88,6 +88,30 @@ in [`src/lib.rs`](src/lib.rs).
 > **Maintainers:** when you append a new `RouterError` variant, add a row
 > here with the next sequential code. Never edit an existing code/row.
 
+### Registration-first invariant
+
+`register_pair` must be called for `(source, destination)` before any of
+its per-pair config setters:
+
+- `set_pair_fee_bps`
+- `set_pair_min_amount`
+- `set_pair_max_amount`
+- `set_pair_liquidity`
+
+Each setter checks `DataKey::Pair(source, destination)` after its own
+admin/sign validation and rejects an unregistered (or since-unregistered)
+pair with `PairNotRegistered` (#5) — the same error `compute_route_fee`
+and `quote_route` already raise. This prevents an admin from writing
+fee/bounds/liquidity config for a corridor that was never enabled, which
+would otherwise waste storage rent and pollute future pair enumeration.
+
+`unregister_pair` does **not** clear the config slots it leaves behind
+(`PairFeeBps`, `PairMinAmount`, `PairMaxAmount`, `PairLiquidity`); a later
+`register_pair` for the same pair silently revives the old values. Whether
+`unregister_pair` should also clear those slots, or refuse to run while
+they're non-default, is a follow-up cleanup question and is out of scope
+for the registration guard above.
+
 ## CI/CD
 
 On every push/PR to `main`, GitHub Actions runs:
@@ -134,9 +158,27 @@ parity guard `test_quote_route_does_not_mutate_counter_or_emit_route_event`
 asserts the counter is unchanged and no new `route` event is emitted after a
 quote.
 
-The `route_event_payloads` test helper scans the accumulated host events
-(init / register / fee_set all emit too) and returns only the decoded payloads
-of events whose single topic is `route`.
+The `route_event_payloads` test helper scans the current host event buffer and
+returns only the decoded payloads of events whose single topic is `route`.
+
+### Pair lifecycle event and idempotency matrix
+
+Pair lifecycle tests assert the exact one-event payload emitted by each
+lifecycle entrypoint before any later contract call refreshes the host event
+buffer:
+
+| Entrypoint | Topic | Data payload | Test |
+|------------|-------|--------------|------|
+| constructor | `init` | `admin` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+| `register_pair` | `pair_reg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+| `set_pair_fee_bps` | `fee_set` | `(source, destination, fee_bps)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+| `set_pair_liquidity` | `liq_set` | `(source, destination, liquidity)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+| `unregister_pair` | `unreg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+
+Two edge-case tests guard idempotency and storage boundaries: unregistering a
+never-registered pair stays a clean no-op while still emitting the lifecycle
+event, and re-registering after unregister restores the pair without clearing
+the stored `PairFeeBps` value.
 
 ## Upgrades
 
