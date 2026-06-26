@@ -80,6 +80,10 @@ in [`src/lib.rs`](src/lib.rs).
 | 11 | `AmountAboveMax` | `compute_route_fee` | Amount is above the pair's configured maximum. |
 | 12 | `InsufficientLiquidity` | `compute_route_fee` | Reported pair liquidity is below the requested amount. |
 | 13 | `MigrationVersionMismatch` | `migrate_v1_to_v2` | Schema is not at v1; migration already applied. |
+| 14 | `TimelockNotElapsed` | `accept_admin_transfer` | Governance timelock has not yet elapsed. |
+| 15 | `NotAuthorized` | `set_pair_liquidity` | Caller is neither admin nor the configured oracle. |
+| 16 | `ReentrantCall` | `compute_route_fee` | Re-entrant invocation detected; lock already held. |
+| 17 | `RouteCooldownActive` | `compute_route_fee` | Pair rate-limited; cooldown not yet elapsed. |
 
 > **Maintainers:** when you append a new `RouterError` variant, add a row
 > here with the next sequential code. Never edit an existing code/row.

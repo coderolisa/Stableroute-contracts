@@ -7,8 +7,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
-    xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    BytesN, Env, Symbol,
 };
 
 /// Aggregated read of every pair-scoped storage slot.
@@ -81,6 +81,18 @@ pub enum DataKey {
     /// Earliest ledger timestamp at which the currently pending admin
     /// transfer may be accepted (`propose_admin_transfer` time + delay).
     PendingAdminEta,
+    /// Reentrancy guard flag. `true` while a mutating entrypoint is
+    /// executing; rejects re-entrant calls with [`RouterError::ReentrantCall`].
+    ReentrancyLock,
+    /// Per-pair route cooldown in seconds. A non-zero value forces a
+    /// minimum gap between successive routes for the pair.
+    PairCooldown(Symbol, Symbol),
+    /// Absolute ceiling on per-route fees (in source units). When set,
+    /// `min(computed_fee, max_fee_absolute)` is charged.
+    MaxFeeAbsolute,
+    /// Scoped liquidity oracle address. May update pair liquidity but
+    /// cannot change fees, pause, rotate admin, or upgrade.
+    Oracle,
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -125,6 +137,16 @@ pub enum RouterError {
     /// `accept_admin_transfer` was called before the governance timelock
     /// delay elapsed.
     TimelockNotElapsed = 14,
+    /// Caller does not have the required role for the operation.
+    /// Returned by `set_pair_liquidity` when the caller is neither admin
+    /// nor the configured oracle.
+    NotAuthorized = 15,
+    /// A re-entrant invocation was attempted while a mutating entrypoint
+    /// held the reentrancy lock.
+    ReentrantCall = 16,
+    /// `compute_route_fee` was called for a pair before the per-pair
+    /// route cooldown elapsed.
+    RouteCooldownActive = 17,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -1515,9 +1537,9 @@ mod test {
     }
 
     /// A caller that is neither admin nor oracle is rejected with
-    /// NotAuthorized (#14).
+    /// NotAuthorized (#15).
     #[test]
-    #[should_panic(expected = "Error(Contract, #14)")]
+    #[should_panic(expected = "Error(Contract, #15)")]
     fn test_random_caller_cannot_update_liquidity() {
         let env = Env::default();
         let (client, _admin) = setup_initialized(&env);
