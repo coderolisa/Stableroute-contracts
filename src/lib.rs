@@ -2924,3 +2924,186 @@ mod test_i41_fee_cap {
         client.set_max_fee_absolute(&-1i128);
     }
 }
+
+#[cfg(test)]
+mod test_batch {
+    use super::*;
+    use soroban_sdk::{symbol_short, testutils::Address as _, vec};
+
+    fn setup(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let id = env.register(StableRouteRouter, (admin.clone(),));
+        let client = StableRouteRouterClient::new(env, &id);
+        (client, admin)
+    }
+
+    #[test]
+    fn test_register_pairs_happy_path() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        client.register_pairs(&vec![
+            &env,
+            (symbol_short!("USDC"), symbol_short!("EURC")),
+            (symbol_short!("XLM"), symbol_short!("USDC")),
+            (symbol_short!("ETH"), symbol_short!("BTC")),
+        ]);
+        assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+        assert!(client.is_pair_registered(&symbol_short!("XLM"), &symbol_short!("USDC")));
+        assert!(client.is_pair_registered(&symbol_short!("ETH"), &symbol_short!("BTC")));
+    }
+
+    #[test]
+    fn test_register_pairs_empty() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        client.register_pairs(&vec![&env]);
+        assert!(!client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #3)")]
+    fn test_register_pairs_atomic_rollback_on_identity() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        client.register_pairs(&vec![
+            &env,
+            (symbol_short!("USDC"), symbol_short!("EURC")),
+            (symbol_short!("XLM"), symbol_short!("XLM")),
+            (symbol_short!("ETH"), symbol_short!("BTC")),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #9)")]
+    fn test_register_pairs_rejects_when_paused() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        client.pause();
+        client.register_pairs(&vec![&env, (symbol_short!("USDC"), symbol_short!("EURC"))]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #18)")]
+    fn test_register_pairs_rejects_too_large_batch() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let mut pairs = std::vec::Vec::new();
+        for i in 0..MAX_BATCH_SIZE + 1 {
+            pairs.push((
+                Symbol::new(&env, &std::format!("SRC{}", i)),
+                Symbol::new(&env, &std::format!("DST{}", i)),
+            ));
+        }
+        client.register_pairs(&Vec::from_slice(&env, &pairs));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_register_pairs_panics_when_uninitialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = StableRouteRouterClient::new(&env, &env.register(StableRouteRouter, ()));
+        client.register_pairs(&vec![&env, (symbol_short!("USDC"), symbol_short!("EURC"))]);
+    }
+
+    #[test]
+    fn test_set_pair_fees_bps_happy_path() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        client.register_pairs(&vec![
+            &env,
+            (symbol_short!("USDC"), symbol_short!("EURC")),
+            (symbol_short!("XLM"), symbol_short!("USDC")),
+        ]);
+        client.set_pair_fees_bps(&vec![
+            &env,
+            (symbol_short!("USDC"), symbol_short!("EURC"), 25u32),
+            (symbol_short!("XLM"), symbol_short!("USDC"), 50u32),
+        ]);
+        assert_eq!(
+            client.get_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            25
+        );
+        assert_eq!(
+            client.get_pair_fee_bps(&symbol_short!("XLM"), &symbol_short!("USDC")),
+            50
+        );
+    }
+
+    #[test]
+    fn test_set_pair_fees_bps_empty() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        client.set_pair_fees_bps(&vec![&env]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #4)")]
+    fn test_set_pair_fees_bps_atomic_rollback_on_high_fee() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        client.register_pairs(&vec![
+            &env,
+            (symbol_short!("USDC"), symbol_short!("EURC")),
+            (symbol_short!("XLM"), symbol_short!("USDC")),
+        ]);
+        client.set_pair_fees_bps(&vec![
+            &env,
+            (symbol_short!("USDC"), symbol_short!("EURC"), 25u32),
+            (symbol_short!("XLM"), symbol_short!("USDC"), MAX_FEE_BPS + 1),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn test_set_pair_fees_bps_rejects_unregistered_pair() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        client.set_pair_fees_bps(&vec![
+            &env,
+            (symbol_short!("USDC"), symbol_short!("EURC"), 25u32),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #9)")]
+    fn test_set_pair_fees_bps_rejects_when_paused() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        client.register_pairs(&vec![&env, (symbol_short!("USDC"), symbol_short!("EURC"))]);
+        client.pause();
+        client.set_pair_fees_bps(&vec![
+            &env,
+            (symbol_short!("USDC"), symbol_short!("EURC"), 25u32),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #18)")]
+    fn test_set_pair_fees_bps_rejects_too_large_batch() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let mut entries = std::vec::Vec::new();
+        for i in 0..MAX_BATCH_SIZE + 1 {
+            entries.push((
+                Symbol::new(&env, &std::format!("SRC{}", i)),
+                Symbol::new(&env, &std::format!("DST{}", i)),
+                10u32,
+            ));
+        }
+        client.set_pair_fees_bps(&Vec::from_slice(&env, &entries));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_set_pair_fees_bps_panics_when_uninitialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = StableRouteRouterClient::new(&env, &env.register(StableRouteRouter, ()));
+        client.set_pair_fees_bps(&vec![
+            &env,
+            (symbol_short!("USDC"), symbol_short!("EURC"), 25u32),
+        ]);
+    }
+}
