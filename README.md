@@ -138,6 +138,55 @@ The `route_event_payloads` test helper scans the accumulated host events
 (init / register / fee_set all emit too) and returns only the decoded payloads
 of events whose single topic is `route`.
 
+## Upgrades
+
+The router supports in-place WASM upgrades via the admin-gated `upgrade` entrypoint,
+so bug fixes can be deployed without losing pair state, admin configuration, or
+route history.
+
+**Flow:**
+
+1. Build the new WASM artifact:
+   ```bash
+   cargo build --target wasm32-unknown-unknown --release
+   ```
+2. Install the WASM on-chain and obtain its hash:
+   ```bash
+   soroban lab build \
+     --copy-to target/wasm32-unknown-unknown/release/stableroute_contracts.wasm
+
+   soroban contract install \
+     --source <admin-key> \
+     --network <network> \
+     --wasm target/wasm32-unknown-unknown/release/stableroute_contracts.wasm
+   ```
+   The command prints a `BytesN<32>` WASM hash (e.g. `cafebabe...`).
+
+3. Call the `upgrade` entrypoint as the admin:
+   ```bash
+   soroban contract invoke \
+     --source <admin-key> \
+     --network <network> \
+     --id <contract-id> \
+     -- \
+     upgrade \
+     --new_wasm_hash cafebabe...
+   ```
+
+**Security notes:**
+
+- Only the admin (`DataKey::Admin`) can call `upgrade`; the entrypoint uses
+  `require_admin` and will panic with `NotInitialized` (#2) if the contract
+  has not been initialised.
+- The call emits an `upgraded` event carrying the new WASM hash, providing a
+  censorable audit trail for indexers and off-chain watchers.
+- Storage (`DataKey` slots) is preserved across the upgrade — the admin, all
+  registered pairs, fees, liquidity reports, route counters, and configuration
+  survive the WASM replacement.
+- `upgrade` is intentionally **not** paused-gated: the admin should be able to
+  fix a bug even while the contract is emergency-stopped. The admin can always
+  unpause, so there is no escalation path through this exception.
+
 ## License
 
 MIT
