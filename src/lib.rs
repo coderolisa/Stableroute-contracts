@@ -896,6 +896,24 @@ impl StableRouteRouter {
     pub fn route_tag(_env: Env, source: Symbol, destination: Symbol) -> (Symbol, Symbol) {
         (source, destination)
     }
+
+    /// Replace the contract's WASM in-place so the router can be patched
+    /// without losing pair state. Admin-gated; emits an `upgraded` event
+    /// carrying the new hash so indexers and watchers can audit upgrades.
+    ///
+    /// ## Trade-off: not paused-gated
+    ///
+    /// An emergency pause should arguably still allow the admin to deploy a
+    /// fix. We therefore skip the `ContractPaused` check — a paused router
+    /// can be upgraded, which is consistent with fixing the bug that caused
+    /// the pause. The admin can already unpause, so there is no escalation
+    /// path through this exception.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env);
+        env.events()
+            .publish((symbol_short!("upgraded"),), &new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
 }
 
 #[cfg(test)]
@@ -989,6 +1007,15 @@ mod test {
         let contract_id = env.register(StableRouteRouter, (admin.clone(),));
         let client = StableRouteRouterClient::new(env, &contract_id);
         (client, admin)
+    }
+
+    /// Register the contract WITHOUT a constructor call so no admin is
+    /// stored. Used to verify that admin-gated entrypoints panic with
+    /// [`RouterError::NotInitialized`] before init.
+    fn setup_uninitialized(env: &Env) -> StableRouteRouterClient<'_> {
+        env.mock_all_auths();
+        let contract_id = env.register(StableRouteRouter, ());
+        StableRouteRouterClient::new(env, &contract_id)
     }
 
     #[test]
@@ -2530,5 +2557,104 @@ mod test_i41_fee_cap {
         let env = Env::default();
         let (client, _s, _d) = setup_pair(&env);
         client.set_max_fee_absolute(&-1i128);
+    }
+}
+
+/// Issue #XX — admin-gated contract upgrade entrypoint.
+///
+/// Covers the happy path (state survives, event emitted), authorization
+/// failure (non-admin caller), and the pre-init guard (#2).
+#[cfg(test)]
+mod test_upgrade {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    /// Deploy the router with admin and a registered USDC→EURC pair.
+    fn setup_pair(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let id = env.register(StableRouteRouter, (admin.clone(),));
+        let client = StableRouteRouterClient::new(env, &id);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        (client, admin)
+    }
+
+    /// Register the contract WITHOUT a constructor call so no admin is stored.
+    fn setup_uninitialized(env: &Env) -> StableRouteRouterClient<'_> {
+        env.mock_all_auths();
+        let id = env.register(StableRouteRouter, ());
+        StableRouteRouterClient::new(env, &id)
+    }
+
+    #[test]
+    fn test_upgrade_preserves_admin_and_registered_pair() {
+        let env = Env::default();
+        let (client, admin) = setup_pair(&env);
+
+        // Upload the current WASM to obtain a valid hash for the upgrade.
+        let new_wasm_hash = env.deployer().upload_contract_wasm(StableRouteRouter);
+
+        // Sanity: state exists before the upgrade.
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+        assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+
+        client.upgrade(&new_wasm_hash);
+
+        // Storage survives the WASM replacement.
+        assert_eq!(client.get_admin(), Some(admin));
+        assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+    }
+
+    #[test]
+    fn test_upgrade_emits_event() {
+        let env = Env::default();
+        let (client, _admin) = setup_pair(&env);
+        let new_wasm_hash = env.deployer().upload_contract_wasm(StableRouteRouter);
+
+        let events_before = env.events().all().events().len();
+
+        client.upgrade(&new_wasm_hash);
+
+        let events_after = env.events().all().events().len();
+        // At least one new event (the `upgraded` event) must have been emitted.
+        assert!(
+            events_after > events_before,
+            "upgrade should emit at least one event"
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_upgrade_rejects_unauthorized_caller() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // Register with the real admin but do NOT mock_all_auths.
+        let id = env.register(StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(&env, &id);
+        let new_wasm_hash = env.deployer().upload_contract_wasm(StableRouteRouter);
+
+        // Only authorize the attacker — admin.require_auth() must fail.
+        env.mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &id,
+                fn_name: "upgrade",
+                args: (new_wasm_hash,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.upgrade(&new_wasm_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_upgrade_panics_when_uninitialized() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        let new_wasm_hash = env.deployer().upload_contract_wasm(StableRouteRouter);
+        client.upgrade(&new_wasm_hash);
     }
 }
