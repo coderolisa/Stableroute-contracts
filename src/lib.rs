@@ -436,6 +436,40 @@ impl StableRouteRouter {
             .publish((symbol_short!("pair_reg"),), (source, destination));
     }
 
+    /// Register multiple `(source, destination)` pairs in a single
+    /// admin-gated call. Each entry is validated identically to
+    /// [`Self::register_pair`] and gets its own `pair_reg` event.
+    ///
+    /// **All-or-nothing:** if any entry fails validation the entire
+    /// transaction is rolled back (Soroban transactions are atomic), so
+    /// callers must ensure every pair is valid before invoking this. The
+    /// batch is also capped at [`MAX_BATCH_SIZE`] entries to bound gas;
+    /// exceeding it panics with [`RouterError::BatchTooLarge`].
+    pub fn register_pairs(env: Env, pairs: Vec<(Symbol, Symbol)>) {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, RouterError::ContractPaused);
+        }
+        Self::require_admin(&env);
+        if pairs.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, RouterError::BatchTooLarge);
+        }
+        for (source, destination) in pairs.iter() {
+            if source == destination {
+                panic_with_error!(&env, RouterError::SourceEqualsDestination);
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::Pair(source.clone(), destination.clone()), &true);
+            env.events()
+                .publish((symbol_short!("pair_reg"),), (source, destination));
+        }
+    }
+
     /// Returns true iff the pair is registered AND has non-zero
     /// reported liquidity. Useful as a quick is-routable check.
     pub fn is_pair_active(env: Env, source: Symbol, destination: Symbol) -> bool {
@@ -801,6 +835,42 @@ impl StableRouteRouter {
         );
         env.events()
             .publish((symbol_short!("fee_set"),), (source, destination, fee_bps));
+    }
+
+    /// Set the routing fee in basis points for multiple registered pairs
+    /// in a single admin-gated call. Each entry is validated identically
+    /// to [`Self::set_pair_fee_bps`] and gets its own `fee_set` event.
+    ///
+    /// **All-or-nothing:** if any entry fails validation the entire
+    /// transaction is rolled back (Soroban transactions are atomic), so
+    /// callers must ensure every entry is well-formed before invoking
+    /// this. Capped at [`MAX_BATCH_SIZE`] entries; exceeding it panics
+    /// with [`RouterError::BatchTooLarge`].
+    pub fn set_pair_fees_bps(env: Env, entries: Vec<(Symbol, Symbol, u32)>) {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, RouterError::ContractPaused);
+        }
+        Self::require_admin(&env);
+        if entries.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, RouterError::BatchTooLarge);
+        }
+        for (source, destination, fee_bps) in entries.iter() {
+            if fee_bps > MAX_FEE_BPS {
+                panic_with_error!(&env, RouterError::FeeBpsTooHigh);
+            }
+            Self::require_pair_registered(&env, &source, &destination);
+            env.storage().persistent().set(
+                &DataKey::PairFeeBps(source.clone(), destination.clone()),
+                &fee_bps,
+            );
+            env.events()
+                .publish((symbol_short!("fee_set"),), (source, destination, fee_bps));
+        }
     }
 
     /// Returns the configured fee in basis points for a pair, or 0 if
