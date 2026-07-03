@@ -106,12 +106,11 @@ and `quote_route` already raise. This prevents an admin from writing
 fee/bounds/liquidity config for a corridor that was never enabled, which
 would otherwise waste storage rent and pollute future pair enumeration.
 
-`unregister_pair` does **not** clear the config slots it leaves behind
-(`PairFeeBps`, `PairMinAmount`, `PairMaxAmount`, `PairLiquidity`); a later
-`register_pair` for the same pair silently revives the old values. Whether
-`unregister_pair` should also clear those slots, or refuse to run while
-they're non-default, is a follow-up cleanup question and is out of scope
-for the registration guard above.
+`unregister_pair` also clears the pair's live config slots (`PairFeeBps`,
+`PairMinAmount`, `PairMaxAmount`, `PairLiquidity`) before emitting a
+`cfg_clr` companion event. Re-registering the same pair therefore starts from
+the documented defaults instead of reviving stale fee, bounds, or liquidity
+values.
 
 ## CI/CD
 
@@ -211,12 +210,13 @@ buffer:
 | `set_pair_fees_bps` | `fee_set` (per entry) | `(source, destination, fee_bps)` (per entry) | `test_set_pair_fees_bps_empty` |
 | `set_pair_liquidity` | `liq_set` | `(source, destination, liquidity)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `unregister_pair` | `unreg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+| `unregister_pair` | `cfg_clr` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `compute_route_fee` | `liq_used` | `(source, destination, remaining_liquidity)` | `test_liq_used_event_emitted_with_remaining` |
 
 Two edge-case tests guard idempotency and storage boundaries: unregistering a
 never-registered pair stays a clean no-op while still emitting the lifecycle
-event, and re-registering after unregister restores the pair without clearing
-the stored `PairFeeBps` value.
+and config-clear events, and re-registering after unregister restores the pair
+with fee, bounds, and liquidity reset to their documented defaults.
 
 ## Upgrades
 

@@ -26,10 +26,10 @@ values in the source.
 | `TotalRoutesAllTime` | singleton | `u64` | persistent | `0` | `get_total_routes_all_time` | `compute_route_fee` |
 | `SchemaVersion` | singleton | `u32` | persistent | `1` | `get_schema_version` | `migrate_v1_to_v2` |
 | `Pair` | `(Symbol, Symbol)` | `bool` | persistent | `false` | `is_pair_registered`, `is_pair_active`, `get_pair_info`, `compute_route_fee`, `quote_route` | `register_pair`; removed by `unregister_pair` |
-| `PairFeeBps` | `(Symbol, Symbol)` | `u32` | persistent | `0` | `get_pair_fee_bps`, `get_pair_info`, compute/quote | `set_pair_fee_bps` |
-| `PairMinAmount` | `(Symbol, Symbol)` | `i128` | persistent | `0` | `get_pair_min_amount`, `get_pair_info`, `compute_route_fee` | `set_pair_min_amount` |
-| `PairMaxAmount` | `(Symbol, Symbol)` | `i128` | persistent | `i128::MAX` | `get_pair_max_amount`, `get_pair_info`, `compute_route_fee` | `set_pair_max_amount` |
-| `PairLiquidity` | `(Symbol, Symbol)` | `i128` | persistent | `0`† | `get_pair_liquidity`, `get_pair_info`, `is_pair_active`, `compute_route_fee`† | `set_pair_liquidity` |
+| `PairFeeBps` | `(Symbol, Symbol)` | `u32` | persistent | `0` | `get_pair_fee_bps`, `get_pair_info`, compute/quote | `set_pair_fee_bps`; cleared by `unregister_pair` |
+| `PairMinAmount` | `(Symbol, Symbol)` | `i128` | persistent | `0` | `get_pair_min_amount`, `get_pair_info`, `compute_route_fee` | `set_pair_min_amount`; cleared by `unregister_pair` |
+| `PairMaxAmount` | `(Symbol, Symbol)` | `i128` | persistent | `i128::MAX` | `get_pair_max_amount`, `get_pair_info`, `compute_route_fee` | `set_pair_max_amount`; cleared by `unregister_pair` |
+| `PairLiquidity` | `(Symbol, Symbol)` | `i128` | persistent | `0`† | `get_pair_liquidity`, `get_pair_info`, `is_pair_active`, `compute_route_fee`† | `set_pair_liquidity`; cleared by `unregister_pair` |
 | `PairLastRouteAt` | `(Symbol, Symbol)` | `u64` | persistent | `None` | `get_pair_last_route_at`, `get_pair_info` (as `0`) | `compute_route_fee` |
 
 † **Liquidity default is context-dependent.** `get_pair_liquidity`,

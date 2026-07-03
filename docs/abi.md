@@ -40,7 +40,7 @@ _pending_ = the proposed pending admin must sign · _none_ = no auth.
 | Entrypoint | Auth | Params | Returns | Errors | Event |
 |-----------|------|--------|---------|--------|-------|
 | `register_pair` | admin | `source: Symbol, destination: Symbol` | — | `ContractPaused` (#9), `NotInitialized` (#2), `SourceEqualsDestination` (#3) | `pair_reg(source, destination)` |
-| `unregister_pair` | admin | `source: Symbol, destination: Symbol` | — | `NotInitialized` (#2) | `unreg(source, destination)` |
+| `unregister_pair` | admin | `source: Symbol, destination: Symbol` | — | `NotInitialized` (#2) | `unreg(source, destination)`, `cfg_clr(source, destination)` |
 | `is_pair_registered` | none | `source: Symbol, destination: Symbol` | `bool` | — | — |
 | `is_pair_active` | none | `source: Symbol, destination: Symbol` | `bool` | — | — |
 | `get_pair_info` | none | `source: Symbol, destination: Symbol` | `PairInfo` | — | — |
@@ -88,6 +88,7 @@ payload tuple. Topic symbols are capped at 9 characters.
 | `paused` | `bool` | `pause` / `unpause` |
 | `pair_reg` | `(source, destination): (Symbol, Symbol)` | `register_pair` |
 | `unreg` | `(source, destination): (Symbol, Symbol)` | `unregister_pair` |
+| `cfg_clr` | `(source, destination): (Symbol, Symbol)` | `unregister_pair` |
 | `fee_set` | `(source, destination, fee_bps): (Symbol, Symbol, u32)` | `set_pair_fee_bps` |
 | `liq_set` | `(source, destination, liquidity): (Symbol, Symbol, i128)` | `set_pair_liquidity` |
 | `route` | `(source, destination, amount): (Symbol, Symbol, i128)` | `compute_route_fee` |

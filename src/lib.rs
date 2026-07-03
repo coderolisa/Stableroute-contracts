@@ -781,28 +781,35 @@ impl StableRouteRouter {
             .set(&DataKey::PairMinAmount(source, destination), &min_amount);
     }
 
-    /// Unregister a previously-registered pair. Admin-gated. Idempotent.
-    /// Does not touch the configured fee — that is removed only when the
-    /// admin overwrites it back to 0 (or calls a future remove_fee).
+    /// Clear all pair-scoped config that should not survive unregister + re-register.
     ///
-    /// **Note (out of scope here):** this leaves `PairFeeBps`,
-    /// `PairMinAmount`, `PairMaxAmount`, and `PairLiquidity` orphaned in
-    /// storage — re-registering the same pair later silently revives the
-    /// old config instead of starting clean. Once `register_pair` is
-    /// called again, those config setters work immediately (no
-    /// `PairNotRegistered` re-check is needed since registration is now
-    /// true), so the orphaned values take effect again without an explicit
-    /// admin write. Whether `unregister_pair` should also clear those slots
-    /// (or refuse to run while they're non-default) is a follow-up cleanup
-    /// question, tracked separately from the registration-before-config
-    /// guard added here.
+    /// This intentionally excludes route counters, cumulative volume, and last-route timestamp;
+    /// those operational-history slots are tracked separately from live pair configuration.
+    fn clear_pair_config(env: &Env, source: Symbol, destination: Symbol) {
+        let storage = env.storage().persistent();
+        storage.remove(&DataKey::PairFeeBps(source.clone(), destination.clone()));
+        storage.remove(&DataKey::PairMinAmount(source.clone(), destination.clone()));
+        storage.remove(&DataKey::PairMaxAmount(source.clone(), destination.clone()));
+        storage.remove(&DataKey::PairLiquidity(source, destination));
+    }
+
+    /// Unregister a previously-registered pair. Admin-gated and idempotent.
+    ///
+    /// Also clears the pair's fee, min amount, max amount, and liquidity config slots so
+    /// re-registering the same corridor starts from documented defaults instead of reviving
+    /// stale config.
     pub fn unregister_pair(env: Env, source: Symbol, destination: Symbol) {
         Self::require_admin(&env);
         env.storage()
             .persistent()
             .remove(&DataKey::Pair(source.clone(), destination.clone()));
+        Self::clear_pair_config(&env, source.clone(), destination.clone());
+        env.events().publish(
+            (symbol_short!("unreg"),),
+            (source.clone(), destination.clone()),
+        );
         env.events()
-            .publish((symbol_short!("unreg"),), (source, destination));
+            .publish((symbol_short!("cfg_clr"),), (source, destination));
     }
 
     /// Returns `true` iff `register_pair` has been called for this pair.
@@ -1700,7 +1707,18 @@ mod test {
         let unreg: (Symbol, Symbol) =
             soroban_sdk::TryFromVal::try_from_val(&env, &unreg_payloads[0])
                 .expect("unreg event data decodes to pair tuple");
-        assert_eq!(unreg, (src, dest));
+        assert_eq!(unreg, (src.clone(), dest.clone()));
+
+        let cfg_clr_payloads = event_payloads(&env, symbol_short!("cfg_clr"));
+        assert_eq!(
+            cfg_clr_payloads.len(),
+            1,
+            "unregister_pair emits one cfg_clr companion event"
+        );
+        let cfg_clr: (Symbol, Symbol) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &cfg_clr_payloads[0])
+                .expect("cfg_clr event data decodes to pair tuple");
+        assert_eq!(cfg_clr, (src, dest));
     }
 
     #[test]
@@ -1722,14 +1740,24 @@ mod test {
         let unreg: (Symbol, Symbol) =
             soroban_sdk::TryFromVal::try_from_val(&env, &unreg_payloads[0])
                 .expect("unreg event data decodes to pair tuple");
-        assert_eq!(unreg, (src, dest));
+        assert_eq!(unreg, (src.clone(), dest.clone()));
+        let cfg_clr_payloads = event_payloads(&env, symbol_short!("cfg_clr"));
+        assert_eq!(
+            cfg_clr_payloads.len(),
+            1,
+            "no-op unregister still documents one config clear event"
+        );
+        let cfg_clr: (Symbol, Symbol) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &cfg_clr_payloads[0])
+                .expect("cfg_clr event data decodes to pair tuple");
+        assert_eq!(cfg_clr, (src, dest));
         assert!(!client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
     }
 
     #[test]
-    fn test_reregister_after_unregister_restores_pair_and_preserves_fee() {
+    fn test_reregister_after_unregister_restores_pair_with_clean_config_defaults() {
         let env = Env::default();
-        let (client, _admin) = setup_initialized(&env);
+        let (client, admin) = setup_initialized(&env);
         let src = symbol_short!("USDC");
         let dest = symbol_short!("EURC");
 
@@ -1740,6 +1768,9 @@ mod test {
             "initial register should emit one pair_reg event"
         );
         client.set_pair_fee_bps(&src, &dest, &42u32);
+        client.set_pair_min_amount(&src, &dest, &10i128);
+        client.set_pair_max_amount(&src, &dest, &1_000i128);
+        client.set_pair_liquidity(&admin, &src, &dest, &500i128);
         client.unregister_pair(&src, &dest);
         assert_eq!(
             event_payloads(&env, symbol_short!("unreg")).len(),
@@ -1748,7 +1779,10 @@ mod test {
         );
 
         assert!(!client.is_pair_registered(&src, &dest));
-        assert_eq!(client.get_pair_fee_bps(&src, &dest), 42);
+        assert_eq!(client.get_pair_fee_bps(&src, &dest), 0);
+        assert_eq!(client.get_pair_min_amount(&src, &dest), 0);
+        assert_eq!(client.get_pair_max_amount(&src, &dest), i128::MAX);
+        assert_eq!(client.get_pair_liquidity(&src, &dest), 0);
 
         client.register_pair(&src, &dest);
         assert_eq!(
@@ -1758,7 +1792,10 @@ mod test {
         );
 
         assert!(client.is_pair_registered(&src, &dest));
-        assert_eq!(client.get_pair_fee_bps(&src, &dest), 42);
+        assert_eq!(client.get_pair_fee_bps(&src, &dest), 0);
+        assert_eq!(client.get_pair_min_amount(&src, &dest), 0);
+        assert_eq!(client.get_pair_max_amount(&src, &dest), i128::MAX);
+        assert_eq!(client.get_pair_liquidity(&src, &dest), 0);
     }
 
     #[test]
