@@ -31,6 +31,14 @@ holds governance power but, by design, **does not custody or move funds**.
 panic with `ContractPaused` (#9). This is the operator's first response to
 a discovered vulnerability.
 
+### Checks before effects
+
+`compute_route_fee` keeps route validation ahead of business effects:
+registration, amount bounds, liquidity sufficiency, and per-pair cooldown
+must all pass before liquidity is debited, counters or timestamps are
+updated, or `liq_used` / `route` events are emitted. A rejected route must
+therefore leave observable route state unchanged.
+
 ### Assumptions
 
 - The admin key is honest and uncompromised. A compromised admin can set

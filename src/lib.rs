@@ -914,6 +914,13 @@ impl StableRouteRouter {
     /// paused so integrators can keep planning routes for when the router
     /// resumes.
     ///
+    /// # Checks/effects ordering
+    ///
+    /// Registered-pair, amount-bound, liquidity, and cooldown guards all
+    /// pass before any route business effect is applied. Only after those
+    /// checks does the function debit liquidity, update counters and
+    /// timestamps, and emit route events.
+    ///
     /// # Liquidity consumption
     ///
     /// After passing all pre-condition checks, the function debits `amount`
@@ -936,10 +943,8 @@ impl StableRouteRouter {
             panic_with_error!(env, RouterError::AmountMustBePositive);
         }
 
-        // Acquire the reentrancy lock before any further reads or effects.
-        Self::enter_nonreentrant(&env);
-
-        // CHECKS (state-dependent preconditions, under the lock).
+        // CHECKS: all state-dependent preconditions stay read-only so a
+        // rejected route leaves no storage write or event behind.
         if !env
             .storage()
             .persistent()
@@ -972,20 +977,7 @@ impl StableRouteRouter {
         if amount > liquidity {
             panic_with_error!(env, RouterError::InsufficientLiquidity);
         }
-        // Debit consumed liquidity, skipping the unset sentinel (i128::MAX).
-        // When no oracle has set a liquidity value the pair is treated as
-        // unbounded — no decrement and no liq_used event are emitted.
-        if liquidity != i128::MAX {
-            let remaining = liquidity.saturating_sub(amount);
-            env.storage().persistent().set(
-                &DataKey::PairLiquidity(source.clone(), destination.clone()),
-                &remaining,
-            );
-            env.events().publish(
-                (symbol_short!("liq_used"),),
-                (source.clone(), destination.clone(), remaining),
-            );
-        }
+
         // Per-pair rate limit. A non-zero cooldown forces a minimum gap
         // between successive routes for the pair. The first route (no
         // recorded timestamp) is always allowed; cooldown == 0 disables
@@ -1012,7 +1004,25 @@ impl StableRouteRouter {
             }
         }
 
-        // EFFECTS: write the counter and timestamp, then emit the event.
+        // Acquire the reentrancy lock only after all route guards pass,
+        // immediately before the write/event phase.
+        Self::enter_nonreentrant(&env);
+
+        // EFFECTS: after all route guards above have passed, debit
+        // liquidity, write counters/timestamps, and emit events.
+        // When no oracle has set a liquidity value the pair is treated as
+        // unbounded — no decrement and no liq_used event are emitted.
+        if liquidity != i128::MAX {
+            let remaining = liquidity.saturating_sub(amount);
+            env.storage().persistent().set(
+                &DataKey::PairLiquidity(source.clone(), destination.clone()),
+                &remaining,
+            );
+            env.events().publish(
+                (symbol_short!("liq_used"),),
+                (source.clone(), destination.clone(), remaining),
+            );
+        }
         let total: u64 = env
             .storage()
             .persistent()
@@ -2405,6 +2415,37 @@ mod test {
             soroban_sdk::TryFromVal::try_from_val(&env, &route_payloads[0])
                 .expect("route data decodes");
         assert_eq!(route, (s, d, 200i128));
+    }
+
+    #[test]
+    fn test_cooldown_blocked_route_has_no_business_side_effects() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
+        client.set_pair_cooldown(&s, &d, &60u64);
+
+        env.ledger().set_timestamp(1_000);
+        client.compute_route_fee(&s, &d, &100i128);
+
+        assert_eq!(client.get_pair_liquidity(&s, &d), 900);
+        assert_eq!(client.get_pair_route_count(&s, &d), 1);
+        assert_eq!(client.get_pair_volume(&s, &d), 100);
+        assert_eq!(client.get_pair_last_route_at(&s, &d), Some(1_000));
+        let liq_events_before = liq_used_event_payloads(&env).len();
+        let route_events_before = route_event_payloads(&env).len();
+
+        env.ledger().set_timestamp(1_030);
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.compute_route_fee(&s, &d, &200i128)
+        }));
+
+        assert!(err.is_err());
+        assert_eq!(client.get_pair_liquidity(&s, &d), 900);
+        assert_eq!(client.get_pair_route_count(&s, &d), 1);
+        assert_eq!(client.get_pair_volume(&s, &d), 100);
+        assert_eq!(client.get_pair_last_route_at(&s, &d), Some(1_000));
+        assert_eq!(liq_used_event_payloads(&env).len(), liq_events_before);
+        assert_eq!(route_event_payloads(&env).len(), route_events_before);
     }
 
     #[test]
