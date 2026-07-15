@@ -81,10 +81,11 @@ in [`src/lib.rs`](src/lib.rs).
 | 12 | `InsufficientLiquidity` | `compute_route_fee` | Reported pair liquidity is below the requested amount. |
 | 13 | `MigrationVersionMismatch` | `migrate_v1_to_v2` | Schema is not at v1; migration already applied. |
 | 14 | `TimelockNotElapsed` | `accept_admin_transfer` | Governance timelock has not elapsed yet; retry after the queued ETA. |
-| 15 | `ReentrantCall` | `compute_route_fee` | Route accounting was re-entered while locked; retry only after the first call completes. |
-| 16 | `NotAuthorized` | `set_pair_liquidity` | Caller is neither the admin nor the configured oracle. |
+| 15 | `NotAuthorized` | `set_pair_liquidity` | Caller is neither the admin nor the configured oracle. |
+| 16 | `ReentrantCall` | `compute_route_fee` | Route accounting was re-entered while locked; retry only after the first call completes. |
 | 17 | `RouteCooldownActive` | `compute_route_fee` | Pair cooldown has not elapsed since the previous routed amount. |
 | 18 | `BatchTooLarge` | `register_pairs`, `set_pair_fees_bps` | Batch length exceeds `MAX_BATCH_SIZE` (100). Split into smaller batches. |
+| 19 | `EmptyBatch` | `register_pairs`, `set_pair_fees_bps` | Batch contains no entries. Provide at least one pair or fee update. |
 
 > **Maintainers:** when you append a new `RouterError` variant, add a row
 > here with the next sequential code. Never edit an existing code/row.
@@ -207,7 +208,7 @@ buffer:
 | `register_pair` | `pair_reg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `register_pairs` | `pair_reg` (per entry) | `(source, destination)` (per entry) | `test_register_pairs_happy_path` |
 | `set_pair_fee_bps` | `fee_set` | `(source, destination, fee_bps)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
-| `set_pair_fees_bps` | `fee_set` (per entry) | `(source, destination, fee_bps)` (per entry) | `test_set_pair_fees_bps_empty` |
+| `set_pair_fees_bps` | `fee_set` (per entry) | `(source, destination, fee_bps)` (per entry) | `test_set_pair_fees_bps_happy_path` |
 | `set_pair_liquidity` | `liq_set` | `(source, destination, liquidity)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `unregister_pair` | `unreg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `unregister_pair` | `cfg_clr` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |

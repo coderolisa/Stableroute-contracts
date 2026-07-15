@@ -155,6 +155,8 @@ pub enum RouterError {
     /// A batch entrypoint was called with more entries than
     /// [`MAX_BATCH_SIZE`].
     BatchTooLarge = 18,
+    /// A batch entrypoint was called with no entries.
+    EmptyBatch = 19,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -451,8 +453,10 @@ impl StableRouteRouter {
     /// **All-or-nothing:** if any entry fails validation the entire
     /// transaction is rolled back (Soroban transactions are atomic), so
     /// callers must ensure every pair is valid before invoking this. The
-    /// batch is also capped at [`MAX_BATCH_SIZE`] entries to bound gas;
-    /// exceeding it panics with [`RouterError::BatchTooLarge`].
+    /// batch must contain at least one entry; an empty batch panics with
+    /// [`RouterError::EmptyBatch`]. The batch is also capped at
+    /// [`MAX_BATCH_SIZE`] entries to bound gas; exceeding it panics with
+    /// [`RouterError::BatchTooLarge`].
     pub fn register_pairs(env: Env, pairs: Vec<(Symbol, Symbol)>) {
         if env
             .storage()
@@ -463,6 +467,9 @@ impl StableRouteRouter {
             panic_with_error!(&env, RouterError::ContractPaused);
         }
         Self::require_admin(&env);
+        if pairs.len() == 0 {
+            panic_with_error!(&env, RouterError::EmptyBatch);
+        }
         if pairs.len() > MAX_BATCH_SIZE {
             panic_with_error!(&env, RouterError::BatchTooLarge);
         }
@@ -859,8 +866,9 @@ impl StableRouteRouter {
     /// **All-or-nothing:** if any entry fails validation the entire
     /// transaction is rolled back (Soroban transactions are atomic), so
     /// callers must ensure every entry is well-formed before invoking
-    /// this. Capped at [`MAX_BATCH_SIZE`] entries; exceeding it panics
-    /// with [`RouterError::BatchTooLarge`].
+    /// this. Requires at least one entry; an empty batch panics with
+    /// [`RouterError::EmptyBatch`]. Capped at [`MAX_BATCH_SIZE`] entries;
+    /// exceeding it panics with [`RouterError::BatchTooLarge`].
     pub fn set_pair_fees_bps(env: Env, entries: Vec<(Symbol, Symbol, u32)>) {
         if env
             .storage()
@@ -871,6 +879,9 @@ impl StableRouteRouter {
             panic_with_error!(&env, RouterError::ContractPaused);
         }
         Self::require_admin(&env);
+        if entries.len() == 0 {
+            panic_with_error!(&env, RouterError::EmptyBatch);
+        }
         if entries.len() > MAX_BATCH_SIZE {
             panic_with_error!(&env, RouterError::BatchTooLarge);
         }
@@ -1226,15 +1237,6 @@ mod test {
         StableRouteRouterClient::new(env, &contract_id)
     }
 
-    /// Register the contract WITHOUT a constructor call so no admin is
-    /// stored. Used to verify that admin-gated entrypoints panic with
-    /// [`RouterError::NotInitialized`] before init.
-    fn setup_uninitialized(env: &Env) -> StableRouteRouterClient<'_> {
-        env.mock_all_auths();
-        let contract_id = env.register(StableRouteRouter, ());
-        StableRouteRouterClient::new(env, &contract_id)
-    }
-
     #[test]
     fn test_version() {
         let env = Env::default();
@@ -1393,7 +1395,7 @@ mod test {
 
     /// The normal success path must RELEASE the reentrancy lock, so two
     /// consecutive `compute_route_fee` calls on the same pair both succeed.
-    /// If the lock leaked, the second call would panic with #15.
+    /// If the lock leaked, the second call would panic with #16.
     #[test]
     fn test_compute_route_fee_releases_lock_for_consecutive_calls() {
         let env = Env::default();
@@ -1418,11 +1420,11 @@ mod test {
     }
 
     /// When the reentrancy lock is already held, `compute_route_fee` must
-    /// reject the call with ReentrantCall (#15). We simulate the in-flight
+    /// reject the call with ReentrantCall (#16). We simulate the in-flight
     /// state by setting the lock directly in the contract's storage, which
     /// is exactly what a re-entrant inner call would observe.
     #[test]
-    #[should_panic(expected = "Error(Contract, #15)")]
+    #[should_panic(expected = "Error(Contract, #16)")]
     fn test_compute_route_fee_rejects_reentry() {
         let env = Env::default();
         let (client, _admin, contract_id) = setup_initialized_with_id(&env);
@@ -3279,6 +3281,16 @@ mod test_batch {
         (client, admin)
     }
 
+    fn setup_without_admin(env: &Env) -> StableRouteRouterClient<'_> {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let id = env.register(StableRouteRouter, (admin,));
+        env.as_contract(&id, || {
+            env.storage().persistent().remove(&DataKey::Admin);
+        });
+        StableRouteRouterClient::new(env, &id)
+    }
+
     #[test]
     fn test_register_pairs_happy_path() {
         let env = Env::default();
@@ -3295,11 +3307,19 @@ mod test_batch {
     }
 
     #[test]
-    fn test_register_pairs_empty() {
+    fn test_register_pairs_single_entry_succeeds() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        client.register_pairs(&vec![&env, (symbol_short!("USDC"), symbol_short!("EURC"))]);
+        assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #19)")]
+    fn test_register_pairs_rejects_empty_batch() {
         let env = Env::default();
         let (client, _admin) = setup(&env);
         client.register_pairs(&vec![&env]);
-        assert!(!client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
     }
 
     #[test]
@@ -3343,8 +3363,7 @@ mod test_batch {
     #[should_panic(expected = "Error(Contract, #2)")]
     fn test_register_pairs_panics_when_uninitialized() {
         let env = Env::default();
-        env.mock_all_auths();
-        let client = StableRouteRouterClient::new(&env, &env.register(StableRouteRouter, ()));
+        let client = setup_without_admin(&env);
         client.register_pairs(&vec![&env, (symbol_short!("USDC"), symbol_short!("EURC"))]);
     }
 
@@ -3373,7 +3392,23 @@ mod test_batch {
     }
 
     #[test]
-    fn test_set_pair_fees_bps_empty() {
+    fn test_set_pair_fees_bps_single_entry_succeeds() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        client.register_pairs(&vec![&env, (symbol_short!("USDC"), symbol_short!("EURC"))]);
+        client.set_pair_fees_bps(&vec![
+            &env,
+            (symbol_short!("USDC"), symbol_short!("EURC"), 25u32),
+        ]);
+        assert_eq!(
+            client.get_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            25
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #19)")]
+    fn test_set_pair_fees_bps_rejects_empty_batch() {
         let env = Env::default();
         let (client, _admin) = setup(&env);
         client.set_pair_fees_bps(&vec![&env]);
@@ -3440,8 +3475,7 @@ mod test_batch {
     #[should_panic(expected = "Error(Contract, #2)")]
     fn test_set_pair_fees_bps_panics_when_uninitialized() {
         let env = Env::default();
-        env.mock_all_auths();
-        let client = StableRouteRouterClient::new(&env, &env.register(StableRouteRouter, ()));
+        let client = setup_without_admin(&env);
         client.set_pair_fees_bps(&vec![
             &env,
             (symbol_short!("USDC"), symbol_short!("EURC"), 25u32),

@@ -40,7 +40,8 @@ _pending_ = the proposed pending admin must sign · _none_ = no auth.
 | Entrypoint | Auth | Params | Returns | Errors | Event |
 |-----------|------|--------|---------|--------|-------|
 | `register_pair` | admin | `source: Symbol, destination: Symbol` | — | `ContractPaused` (#9), `NotInitialized` (#2), `SourceEqualsDestination` (#3) | `pair_reg(source, destination)` |
-| `unregister_pair` | admin | `source: Symbol, destination: Symbol` | — | `NotInitialized` (#2) | `unreg(source, destination)`, `cfg_clr(source, destination)` |
+| `register_pairs` | admin | `pairs: Vec<(Symbol, Symbol)>` | — | `ContractPaused` (#9), `NotInitialized` (#2), `EmptyBatch` (#19), `BatchTooLarge` (#18), `SourceEqualsDestination` (#3) | `pair_reg(source, destination)` per entry |
+| `unregister_pair` | admin | `source: Symbol, destination: Symbol` | — | `NotInitialized` (#2) | `unreg(source, destination)` |
 | `is_pair_registered` | none | `source: Symbol, destination: Symbol` | `bool` | — | — |
 | `is_pair_active` | none | `source: Symbol, destination: Symbol` | `bool` | — | — |
 | `get_pair_info` | none | `source: Symbol, destination: Symbol` | `PairInfo` | — | — |
@@ -50,6 +51,7 @@ _pending_ = the proposed pending admin must sign · _none_ = no auth.
 | Entrypoint | Auth | Params | Returns | Errors | Event |
 |-----------|------|--------|---------|--------|-------|
 | `set_pair_fee_bps` | admin | `source: Symbol, destination: Symbol, fee_bps: u32` | — | `ContractPaused` (#9), `NotInitialized` (#2), `FeeBpsTooHigh` (#4) | `fee_set(source, destination, fee_bps)` |
+| `set_pair_fees_bps` | admin | `entries: Vec<(Symbol, Symbol, u32)>` | — | `ContractPaused` (#9), `NotInitialized` (#2), `EmptyBatch` (#19), `BatchTooLarge` (#18), `FeeBpsTooHigh` (#4), `PairNotRegistered` (#5) | `fee_set(source, destination, fee_bps)` per entry |
 | `get_pair_fee_bps` | none | `source: Symbol, destination: Symbol` | `u32` | — | — |
 | `set_fee_recipient` | admin | `recipient: Address` | — | `NotInitialized` (#2) | — |
 | `get_fee_recipient` | none | — | `Option<Address>` | — | — |
