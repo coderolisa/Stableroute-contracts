@@ -467,7 +467,7 @@ impl StableRouteRouter {
             panic_with_error!(&env, RouterError::ContractPaused);
         }
         Self::require_admin(&env);
-        if pairs.len() == 0 {
+        if pairs.is_empty() {
             panic_with_error!(&env, RouterError::EmptyBatch);
         }
         if pairs.len() > MAX_BATCH_SIZE {
@@ -819,6 +819,34 @@ impl StableRouteRouter {
             .publish((symbol_short!("cfg_clr"),), (source, destination));
     }
 
+    /// Explicitly reset a pair's operational-history metrics: `PairRouteCount`,
+    /// `PairVolume`, and `PairLastRouteAt`. Admin-gated.
+    ///
+    /// By default, `unregister_pair` deliberately preserves these metrics so a
+    /// pair's lifetime history survives a transient unregister/register cycle.
+    /// This entrypoint is the explicit, opt-in way to discard that history —
+    /// call it (before or after `unregister_pair` + `register_pair`) when a
+    /// re-listed corridor should start a fresh operational life instead of
+    /// inheriting stale route counts and volume from its previous listing.
+    ///
+    /// Does not touch pair registration (`Pair`) or config (fee/bounds/
+    /// liquidity, see `clear_pair_config`) — only the three metrics slots.
+    pub fn purge_pair_metrics(env: Env, source: Symbol, destination: Symbol) {
+        Self::require_admin(&env);
+        let storage = env.storage().persistent();
+        storage.remove(&DataKey::PairRouteCount(
+            source.clone(),
+            destination.clone(),
+        ));
+        storage.remove(&DataKey::PairVolume(source.clone(), destination.clone()));
+        storage.remove(&DataKey::PairLastRouteAt(
+            source.clone(),
+            destination.clone(),
+        ));
+        env.events()
+            .publish((symbol_short!("pair_mrst"),), (source, destination));
+    }
+
     /// Returns `true` iff `register_pair` has been called for this pair.
     pub fn is_pair_registered(env: Env, source: Symbol, destination: Symbol) -> bool {
         env.storage()
@@ -879,7 +907,7 @@ impl StableRouteRouter {
             panic_with_error!(&env, RouterError::ContractPaused);
         }
         Self::require_admin(&env);
-        if entries.len() == 0 {
+        if entries.is_empty() {
             panic_with_error!(&env, RouterError::EmptyBatch);
         }
         if entries.len() > MAX_BATCH_SIZE {
@@ -1808,6 +1836,124 @@ mod test {
         assert_eq!(client.get_pair_min_amount(&src, &dest), 0);
         assert_eq!(client.get_pair_max_amount(&src, &dest), i128::MAX);
         assert_eq!(client.get_pair_liquidity(&src, &dest), 0);
+    }
+
+    /// Documents the current, unchanged behavior: `unregister_pair` alone
+    /// leaves `PairRouteCount`, `PairVolume`, and `PairLastRouteAt` intact,
+    /// so a straight unregister + re-register cycle inherits prior metrics.
+    #[test]
+    fn test_unregister_then_reregister_preserves_metrics_by_default() {
+        let env = Env::default();
+        let src = symbol_short!("USDC");
+        let dest = symbol_short!("EURC");
+        let client = setup_routable_pair(&env, &src, &dest, 50u32);
+
+        env.ledger().set_timestamp(777);
+        client.compute_route_fee(&src, &dest, &1_000_i128);
+
+        assert_eq!(client.get_pair_route_count(&src, &dest), 1);
+        assert_eq!(client.get_pair_volume(&src, &dest), 1_000);
+        assert_eq!(client.get_pair_last_route_at(&src, &dest), Some(777));
+
+        client.unregister_pair(&src, &dest);
+        client.register_pair(&src, &dest);
+
+        assert!(client.is_pair_registered(&src, &dest));
+        assert_eq!(
+            client.get_pair_route_count(&src, &dest),
+            1,
+            "unregister_pair must not clear PairRouteCount"
+        );
+        assert_eq!(
+            client.get_pair_volume(&src, &dest),
+            1_000,
+            "unregister_pair must not clear PairVolume"
+        );
+        assert_eq!(
+            client.get_pair_last_route_at(&src, &dest),
+            Some(777),
+            "unregister_pair must not clear PairLastRouteAt"
+        );
+    }
+
+    /// `purge_pair_metrics` is the explicit, opt-in reset: it clears all
+    /// three metrics slots and emits a `pair_mrst` event with the pair.
+    #[test]
+    fn test_purge_pair_metrics_resets_counters_and_emits_event() {
+        let env = Env::default();
+        let src = symbol_short!("USDC");
+        let dest = symbol_short!("EURC");
+        let client = setup_routable_pair(&env, &src, &dest, 50u32);
+
+        env.ledger().set_timestamp(999);
+        client.compute_route_fee(&src, &dest, &2_000_i128);
+
+        assert_eq!(client.get_pair_route_count(&src, &dest), 1);
+        assert_eq!(client.get_pair_volume(&src, &dest), 2_000);
+        assert_eq!(client.get_pair_last_route_at(&src, &dest), Some(999));
+
+        client.purge_pair_metrics(&src, &dest);
+
+        // Check the emitted event immediately after the triggering call,
+        // before any further client invocation can roll the host event
+        // buffer over to a later call's events.
+        let payloads = event_payloads(&env, symbol_short!("pair_mrst"));
+        assert_eq!(
+            payloads.len(),
+            1,
+            "purge_pair_metrics emits exactly one pair_mrst event"
+        );
+        let decoded: (Symbol, Symbol) = soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+            .expect("pair_mrst event data decodes to pair tuple");
+        assert_eq!(decoded, (src.clone(), dest.clone()));
+
+        assert_eq!(client.get_pair_route_count(&src, &dest), 0);
+        assert_eq!(client.get_pair_volume(&src, &dest), 0);
+        assert_eq!(client.get_pair_last_route_at(&src, &dest), None);
+    }
+
+    /// `purge_pair_metrics` does not disturb registration or live config —
+    /// only the three metrics slots.
+    #[test]
+    fn test_purge_pair_metrics_does_not_touch_registration_or_config() {
+        let env = Env::default();
+        let src = symbol_short!("USDC");
+        let dest = symbol_short!("EURC");
+        let client = setup_routable_pair(&env, &src, &dest, 50u32);
+        client.set_pair_min_amount(&src, &dest, &10i128);
+        client.set_pair_max_amount(&src, &dest, &1_000i128);
+
+        client.compute_route_fee(&src, &dest, &500_i128);
+        client.purge_pair_metrics(&src, &dest);
+
+        assert!(client.is_pair_registered(&src, &dest));
+        assert_eq!(client.get_pair_fee_bps(&src, &dest), 50);
+        assert_eq!(client.get_pair_min_amount(&src, &dest), 10);
+        assert_eq!(client.get_pair_max_amount(&src, &dest), 1_000);
+    }
+
+    /// `purge_pair_metrics` is admin-gated like every other mutating
+    /// entrypoint: a non-admin caller's `require_auth()` must fail.
+    #[test]
+    #[should_panic]
+    fn test_purge_pair_metrics_rejects_non_admin() {
+        let env = Env::default();
+        let src = symbol_short!("USDC");
+        let dest = symbol_short!("EURC");
+        let stranger = Address::generate(&env);
+        let client = setup_routable_pair(&env, &src, &dest, 50u32);
+        client.compute_route_fee(&src, &dest, &500_i128);
+
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &stranger,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "purge_pair_metrics",
+                args: (src.clone(), dest.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.purge_pair_metrics(&src, &dest);
     }
 
     #[test]
@@ -2995,7 +3141,7 @@ mod test_i18_read_surface {
     #[test]
     fn test_pair_info_reflects_configuration() {
         let env = Env::default();
-        let (client, admin) = setup(&env);
+        let (client, _admin) = setup(&env);
         let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
         client.register_pair(&s, &d);
         client.set_pair_fee_bps(&s, &d, &25u32);
@@ -3014,7 +3160,7 @@ mod test_i18_read_surface {
     #[test]
     fn test_is_pair_active_requires_registration_and_liquidity() {
         let env = Env::default();
-        let (client, admin) = setup(&env);
+        let (client, _admin) = setup(&env);
         let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
         assert!(!client.is_pair_active(&s, &d));
         client.register_pair(&s, &d);
