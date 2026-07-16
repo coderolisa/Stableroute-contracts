@@ -143,6 +143,9 @@ tiers) and the PR checklist.
 
 ## Testing notes
 
+### Authorization testing
+All admin-gated entrypoints have negative-authorization tests in `test_i19_authorization` (asserting non-admins are rejected) and positive controls (asserting admins can invoke them). When adding a new admin-gated entrypoint, add a corresponding `test_*_requires_admin` case to this module.
+
 ## Liquidity consumption model
 
 `compute_route_fee` debits the routed `amount` from the pair's stored
