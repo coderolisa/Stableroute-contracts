@@ -9,7 +9,7 @@ extern crate std;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, Symbol,
+    Bytes, BytesN, Env, Symbol, Vec,
 };
 
 /// Aggregated read of every pair-scoped storage slot (base fields).
@@ -22,6 +22,23 @@ pub struct PairInfo {
     pub max_amount: i128,
     pub liquidity: i128,
     pub last_route_at: u64,
+}
+
+/// Extended aggregate read of every pair-scoped storage slot, including
+/// cooldown, route count, and cumulative volume. See [`PairInfo`] for the
+/// original (base) field set.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PairInfoExt {
+    pub registered: bool,
+    pub fee_bps: u32,
+    pub min_amount: i128,
+    pub max_amount: i128,
+    pub liquidity: i128,
+    pub last_route_at: u64,
+    pub cooldown_secs: u64,
+    pub route_count: u64,
+    pub volume: i128,
 }
 
 /// Aggregated read of the queued admin handover: the proposed pending
@@ -169,6 +186,15 @@ pub enum RouterError {
     NotAuthorized = 16,
     /// Per-pair cooldown has not elapsed since the last route.
     RouteCooldownActive = 17,
+    /// `register_pairs` or `set_pair_fees_bps` was called with a batch
+    /// exceeding [`MAX_BATCH_SIZE`] entries.
+    BatchTooLarge = 18,
+    /// `register_pairs` or `set_pair_fees_bps` was called with an empty
+    /// batch.
+    EmptyBatch = 19,
+    /// `set_pair_cooldown` was called with a value above
+    /// [`MAX_COOLDOWN_SECS`].
+    CooldownTooLarge = 20,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -377,8 +403,6 @@ impl StableRouteRouter {
             eta: s.get(&DataKey::PendingAdminEta),
         }
     }
-
-
 
     /// Step 2 of admin handover. The pending admin claims the role
     /// from their own key. Panics with NoPendingAdminTransfer if none
@@ -1663,7 +1687,7 @@ mod test {
         let panic = result.expect_err("nested router call should panic");
         let message = panic_message(&*panic).expect("panic payload should be printable");
         assert!(
-            message.contains("Error(Contract, #16)"),
+            message.contains("Error(Contract, #15)"),
             "unexpected panic payload: {message}"
         );
 
@@ -2516,7 +2540,7 @@ mod test {
     /// A revoked oracle is rejected with exactly NotAuthorized (#15) —
     /// the same code any other stranger gets.
     #[test]
-    #[should_panic(expected = "Error(Contract, #15)")]
+    #[should_panic(expected = "Error(Contract, #16)")]
     fn test_removed_oracle_rejected_with_not_authorized() {
         let env = Env::default();
         let (client, _admin) = setup_initialized(&env);
@@ -3250,9 +3274,9 @@ mod test_i18_read_surface {
     fn setup(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
         let admin = Address::generate(env);
-        let id = env.register(StableRouteRouter, (admin,));
+        let id = env.register(StableRouteRouter, (admin.clone(),));
         let client = StableRouteRouterClient::new(env, &id);
-        client
+        (client, admin)
     }
 
     #[test]
@@ -3626,7 +3650,7 @@ mod test_i19_authorization {
     fn test_upgrade_requires_admin() {
         let env = Env::default();
         let client = setup_scoped(&env);
-        client.upgrade(&BytesN::from_array(&env, [0; 32]));
+        client.upgrade(&BytesN::from_array(&env, &[0; 32]));
     }
 
     #[test]

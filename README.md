@@ -84,6 +84,9 @@ in [`src/lib.rs`](src/lib.rs).
 | 15 | `ReentrantCall` | `compute_route_fee` | Route accounting was re-entered while locked; retry only after the first call completes. |
 | 16 | `NotAuthorized` | `set_pair_liquidity` | Caller is neither the admin nor the configured oracle. |
 | 17 | `RouteCooldownActive` | `compute_route_fee` | Pair cooldown has not elapsed since the previous routed amount. |
+| 18 | `BatchTooLarge` | `register_pairs`, `set_pair_fees_bps` | Batch exceeds `MAX_BATCH_SIZE` (100) entries. Split into smaller batches. |
+| 19 | `EmptyBatch` | `register_pairs`, `set_pair_fees_bps` | Batch must contain at least one entry. |
+| 20 | `CooldownTooLarge` | `set_pair_cooldown` | Cooldown exceeds `MAX_COOLDOWN_SECS` (30 days). Lower the value. |
 
 > **Maintainers:** when you append a new `RouterError` variant, add a row
 > here with the next sequential code. Never edit an existing code/row.
