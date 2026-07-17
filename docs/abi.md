@@ -45,6 +45,7 @@ _pending_ = the proposed pending admin must sign · _none_ = no auth.
 | `is_pair_registered` | none | `source: Symbol, destination: Symbol` | `bool` | — | — |
 | `is_pair_active` | none | `source: Symbol, destination: Symbol` | `bool` | — | — |
 | `get_pair_info` | none | `source: Symbol, destination: Symbol` | `PairInfo` | — | — |
+| `get_pair_info_ext` | none | `source: Symbol, destination: Symbol` | `PairInfoExt` | — | — |
 
 ## Fees
 
@@ -94,6 +95,18 @@ payload tuple. Topic symbols are capped at 9 characters.
 | `fee_set` | `(source, destination, fee_bps): (Symbol, Symbol, u32)` | `set_pair_fee_bps` |
 | `liq_set` | `(source, destination, liquidity): (Symbol, Symbol, i128)` | `set_pair_liquidity` |
 | `route` | `(source, destination, amount): (Symbol, Symbol, i128)` | `compute_route_fee` |
+
+## Extended pair info (`PairInfoExt`)
+
+Added in a later batch after the original `PairInfo`, `get_pair_info_ext`
+returns all per-pair slots in a single round-trip. The extra fields beyond
+`PairInfo` are:
+
+| Field | Type | Default | Source slot |
+|-------|------|---------|-------------|
+| `cooldown_secs` | `u64` | `0` (disabled) | `PairCooldown` |
+| `route_count` | `u64` | `0` | `PairRouteCount` |
+| `volume` | `i128` | `0` | `PairVolume` |
 
 > Keep this catalog in sync with the `symbol_short!(...)` calls in
 > `src/lib.rs` whenever an entrypoint or event is added or changed.

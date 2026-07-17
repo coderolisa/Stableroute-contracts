@@ -12,7 +12,7 @@ use soroban_sdk::{
     Bytes, BytesN, Env, Symbol, Vec,
 };
 
-/// Aggregated read of every pair-scoped storage slot.
+/// Aggregated read of every pair-scoped storage slot (base fields).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PairInfo {
@@ -22,6 +22,27 @@ pub struct PairInfo {
     pub max_amount: i128,
     pub liquidity: i128,
     pub last_route_at: u64,
+}
+
+/// Extended pair info including per-pair slots added after the original
+/// `PairInfo` shipped. ABI-stable complement to [`PairInfo`]; dashboards
+/// should prefer this over issuing individual getter calls.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PairInfoExt {
+    /// Base fields reproduced from [`PairInfo`].
+    pub registered: bool,
+    pub fee_bps: u32,
+    pub min_amount: i128,
+    pub max_amount: i128,
+    pub liquidity: i128,
+    pub last_route_at: u64,
+    /// Per-pair route cooldown in seconds (0 = disabled).
+    pub cooldown_secs: u64,
+    /// Lifetime count of `compute_route_fee` invocations for this pair.
+    pub route_count: u64,
+    /// Cumulative routed volume in source units for this pair.
+    pub volume: i128,
 }
 
 /// Storage keys used by the StableRoute router.
@@ -534,6 +555,52 @@ impl StableRouteRouter {
                 .unwrap_or(0),
             last_route_at: s
                 .get(&DataKey::PairLastRouteAt(source, destination))
+                .unwrap_or(0),
+        }
+    }
+
+    /// Extended aggregate read including newer per-pair slots that were
+    /// added after the original [`PairInfo`] shipped. Returns every
+    /// per-pair slot in a single round-trip so dashboards avoid issuing
+    /// separate calls for cooldown, route count, and volume.
+    ///
+    /// Defaults follow the same sentinel conventions as the individual
+    /// getters: cooldown 0 (disabled), route count 0, volume 0.
+    pub fn get_pair_info_ext(env: Env, source: Symbol, destination: Symbol) -> PairInfoExt {
+        let s = env.storage().persistent();
+        PairInfoExt {
+            registered: s
+                .get(&DataKey::Pair(source.clone(), destination.clone()))
+                .unwrap_or(false),
+            fee_bps: s
+                .get(&DataKey::PairFeeBps(source.clone(), destination.clone()))
+                .unwrap_or(0),
+            min_amount: s
+                .get(&DataKey::PairMinAmount(source.clone(), destination.clone()))
+                .unwrap_or(0),
+            max_amount: s
+                .get(&DataKey::PairMaxAmount(source.clone(), destination.clone()))
+                .unwrap_or(i128::MAX),
+            liquidity: s
+                .get(&DataKey::PairLiquidity(source.clone(), destination.clone()))
+                .unwrap_or(0),
+            last_route_at: s
+                .get(&DataKey::PairLastRouteAt(
+                    source.clone(),
+                    destination.clone(),
+                ))
+                .unwrap_or(0),
+            cooldown_secs: s
+                .get(&DataKey::PairCooldown(source.clone(), destination.clone()))
+                .unwrap_or(0),
+            route_count: s
+                .get(&DataKey::PairRouteCount(
+                    source.clone(),
+                    destination.clone(),
+                ))
+                .unwrap_or(0),
+            volume: s
+                .get(&DataKey::PairVolume(source, destination))
                 .unwrap_or(0),
         }
     }
@@ -3406,6 +3473,118 @@ mod test_i18_read_surface {
         assert_eq!(client.get_pair_last_route_at(&s, &d), None);
         client.compute_route_fee(&s, &d, &1_000i128);
         assert_eq!(client.get_pair_last_route_at(&s, &d), Some(424_242));
+    }
+
+    // --- get_pair_info_ext ---
+
+    #[test]
+    fn test_pair_info_ext_defaults_for_unconfigured_pair() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        let ext = client.get_pair_info_ext(&s, &d);
+        assert_eq!(
+            ext,
+            PairInfoExt {
+                registered: false,
+                fee_bps: 0,
+                min_amount: 0,
+                max_amount: i128::MAX,
+                liquidity: 0,
+                last_route_at: 0,
+                cooldown_secs: 0,
+                route_count: 0,
+                volume: 0,
+            }
+        );
+        // Sanity check: individual getters agree.
+        assert_eq!(ext.registered, client.is_pair_registered(&s, &d));
+        assert_eq!(ext.fee_bps, client.get_pair_fee_bps(&s, &d));
+        assert_eq!(ext.min_amount, client.get_pair_min_amount(&s, &d));
+        assert_eq!(ext.max_amount, client.get_pair_max_amount(&s, &d));
+        assert_eq!(ext.liquidity, client.get_pair_liquidity(&s, &d));
+        assert_eq!(ext.cooldown_secs, client.get_pair_cooldown(&s, &d));
+        assert_eq!(ext.route_count, client.get_pair_route_count(&s, &d));
+        assert_eq!(ext.volume, client.get_pair_volume(&s, &d));
+    }
+
+    #[test]
+    fn test_pair_info_ext_reflects_configuration() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        let admin = client.get_admin().expect("constructor stores admin");
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &25u32);
+        client.set_pair_min_amount(&s, &d, &10i128);
+        client.set_pair_max_amount(&s, &d, &1_000i128);
+        client.set_pair_liquidity(&admin, &s, &d, &500i128);
+        client.set_pair_cooldown(&s, &d, &120u64);
+
+        let ext = client.get_pair_info_ext(&s, &d);
+        assert!(ext.registered);
+        assert_eq!(ext.fee_bps, 25);
+        assert_eq!(ext.min_amount, 10);
+        assert_eq!(ext.max_amount, 1_000);
+        assert_eq!(ext.liquidity, 500);
+        assert_eq!(ext.cooldown_secs, 120);
+        assert_eq!(ext.route_count, 0);
+        assert_eq!(ext.volume, 0);
+
+        // Individual getters agree.
+        assert_eq!(ext.cooldown_secs, client.get_pair_cooldown(&s, &d));
+        assert_eq!(ext.route_count, client.get_pair_route_count(&s, &d));
+        assert_eq!(ext.volume, client.get_pair_volume(&s, &d));
+    }
+
+    #[test]
+    fn test_pair_info_ext_after_routing() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        let admin = client.get_admin().expect("constructor stores admin");
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &10u32);
+        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
+
+        // Route twice to accumulate count and volume.
+        client.compute_route_fee(&s, &d, &200i128);
+        client.compute_route_fee(&s, &d, &300i128);
+
+        let ext = client.get_pair_info_ext(&s, &d);
+        assert!(ext.registered);
+        assert_eq!(ext.route_count, 2);
+        assert_eq!(ext.volume, 500);
+        // Liquidity was debited: 1_000 - 200 - 300 = 500.
+        assert_eq!(ext.liquidity, 500);
+
+        // Matches individual getters.
+        assert_eq!(ext.route_count, client.get_pair_route_count(&s, &d));
+        assert_eq!(ext.volume, client.get_pair_volume(&s, &d));
+        assert_eq!(ext.liquidity, client.get_pair_liquidity(&s, &d));
+    }
+
+    #[test]
+    fn test_pair_info_ext_matches_get_pair_info_base_fields() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let (s, d) = (symbol_short!("XLM"), symbol_short!("USDC"));
+        let admin = client.get_admin().expect("constructor stores admin");
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &50u32);
+        client.set_pair_min_amount(&s, &d, &5i128);
+        client.set_pair_max_amount(&s, &d, &10_000i128);
+        client.set_pair_liquidity(&admin, &s, &d, &2_000i128);
+
+        let info = client.get_pair_info(&s, &d);
+        let ext = client.get_pair_info_ext(&s, &d);
+        // Base fields must be identical.
+        assert_eq!(info.registered, ext.registered);
+        assert_eq!(info.fee_bps, ext.fee_bps);
+        assert_eq!(info.min_amount, ext.min_amount);
+        assert_eq!(info.max_amount, ext.max_amount);
+        assert_eq!(info.liquidity, ext.liquidity);
+        assert_eq!(info.last_route_at, ext.last_route_at);
     }
 }
 
