@@ -114,6 +114,26 @@ would otherwise waste storage rent and pollute future pair enumeration.
 the documented defaults instead of reviving stale fee, bounds, or liquidity
 values.
 
+### Per-pair metric lifecycle: preserved by default, explicitly reset on demand
+
+`PairRouteCount`, `PairVolume`, and `PairLastRouteAt` are operational-history
+slots tracked separately from live pair configuration. `unregister_pair`
+**deliberately does not touch them** — a pair's lifetime route count,
+cumulative volume, and last-route timestamp survive an unregister/register
+cycle by default. This is existing, unchanged behaviour: unregistering and
+re-registering the same corridor keeps its history intact unless you opt
+into a reset.
+
+When a re-listed pair should start a fresh operational life instead of
+inheriting stale metrics from its previous listing, call the admin-gated
+`purge_pair_metrics(source, destination)`. It removes `PairRouteCount`,
+`PairVolume`, and `PairLastRouteAt` for the pair and emits a `pair_mrst`
+event with `(source, destination)`. It does not touch pair registration or
+config (fee/bounds/liquidity) — call `unregister_pair`/`clear_pair_config`
+separately for that. `purge_pair_metrics` can be called before or after an
+unregister/register cycle, or at any time an admin wants to zero a pair's
+history.
+
 ## CI/CD
 
 On every push/PR to `main`, GitHub Actions runs:
@@ -221,11 +241,20 @@ buffer:
 | `unregister_pair` | `unreg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `unregister_pair` | `cfg_clr` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `compute_route_fee` | `liq_used` | `(source, destination, remaining_liquidity)` | `test_liq_used_event_emitted_with_remaining` |
+| `purge_pair_metrics` | `pair_mrst` | `(source, destination)` | `test_purge_pair_metrics_resets_counters_and_emits_event` |
 
 Two edge-case tests guard idempotency and storage boundaries: unregistering a
 never-registered pair stays a clean no-op while still emitting the lifecycle
 and config-clear events, and re-registering after unregister restores the pair
 with fee, bounds, and liquidity reset to their documented defaults.
+
+Metrics behave differently from config: `test_unregister_then_reregister_preserves_metrics_by_default`
+confirms `PairRouteCount`/`PairVolume`/`PairLastRouteAt` survive an
+unregister + re-register cycle unchanged, while
+`test_purge_pair_metrics_resets_counters_and_emits_event` and
+`test_purge_pair_metrics_does_not_touch_registration_or_config` confirm the
+explicit `purge_pair_metrics` entrypoint zeroes only those three metrics
+slots without disturbing registration or config.
 
 ## Upgrades
 
