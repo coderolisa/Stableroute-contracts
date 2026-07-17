@@ -952,7 +952,8 @@ impl StableRouteRouter {
         storage.remove(&DataKey::PairFeeBps(source.clone(), destination.clone()));
         storage.remove(&DataKey::PairMinAmount(source.clone(), destination.clone()));
         storage.remove(&DataKey::PairMaxAmount(source.clone(), destination.clone()));
-        storage.remove(&DataKey::PairLiquidity(source, destination));
+        storage.remove(&DataKey::PairLiquidity(source.clone(), destination.clone()));
+        storage.remove(&DataKey::PairCooldown(source, destination));
     }
 
     /// Unregister a previously-registered pair. Admin-gated and idempotent.

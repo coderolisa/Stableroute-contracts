@@ -257,6 +257,7 @@ buffer:
 | `set_pair_fee_bps` | `fee_set` | `(source, destination, fee_bps)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `set_pair_fees_bps` | `fee_set` (per entry) | `(source, destination, fee_bps)` (per entry) | `test_set_pair_fees_bps_happy_path` |
 | `set_pair_liquidity` | `liq_set` | `(source, destination, liquidity)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+| `set_pair_cooldown` | `cd_set` | `(source, destination, cooldown_secs)` | |
 | `unregister_pair` | `unreg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `unregister_pair` | `cfg_clr` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `compute_route_fee` | `liq_used` | `(source, destination, remaining_liquidity)` | `test_liq_used_event_emitted_with_remaining` |
@@ -266,6 +267,23 @@ Two edge-case tests guard idempotency and storage boundaries: unregistering a
 never-registered pair stays a clean no-op while still emitting the lifecycle
 and config-clear events, and re-registering after unregister restores the pair
 with fee, bounds, and liquidity reset to their documented defaults.
+
+## Per-pair route cooldown rate limit
+
+The router supports an optional per-pair cooldown to enforce a minimum interval between routes for a given `(source, destination)` pair. This mitigates spam routing, oracle front-running, and griefing of the route counter.
+
+### How it works
+
+- `set_pair_cooldown(source, destination, cooldown_secs)` (admin-gated) sets the cooldown for a pair (0 = disabled).
+- `get_pair_cooldown(source, destination)` reads the current cooldown (0 by default).
+- On the first route for a pair, no cooldown is applied.
+- On subsequent routes, if the cooldown is non-zero, the router checks if the current ledger timestamp is at least `PairLastRouteAt + cooldown_secs`. If not, it rejects with `RouteCooldownActive` (#17).
+
+### Security assumptions
+
+- Cooldown uses addition (`last + cooldown`) instead of subtraction to avoid underflow.
+- Disabled cooldown (0) preserves backwards compatibility.
+- First route is always allowed.
 
 ## Admin transfer flow
 
