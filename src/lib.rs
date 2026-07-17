@@ -3838,3 +3838,348 @@ mod test_batch {
         ]);
     }
 }
+
+/// Issue #153: Test coverage for the version surface and NotInitialized paths.
+///
+/// This module validates that:
+/// - `version()` is stable (`ROUTER_V2`) independent of schema version
+/// - `get_schema_version()` returns 1 before any migration (default fallback)
+/// - All admin-gated entrypoints panic with `NotInitialized` (#2) on uninitialized contracts
+/// - Security invariants: no admin entrypoint succeeds before initialization
+#[cfg(test)]
+mod test_i153_version_uninitialized {
+    use super::*;
+    use soroban_sdk::{symbol_short, testutils::Address as _};
+
+    // ========== Helper Setup Functions ==========
+
+    /// Register a contract with admin set (initialized).
+    fn setup_initialized(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let contract_id = env.register(StableRouteRouter, (admin.clone(),));
+        let client = StableRouteRouterClient::new(env, &contract_id);
+        (client, admin)
+    }
+
+    /// Register a contract and then remove the admin from storage to simulate an
+    /// uninitialized state (admin slot is empty). Used to test NotInitialized (#2) failures.
+    fn setup_uninitialized(env: &Env) -> StableRouteRouterClient<'_> {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let contract_id = env.register(StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(env, &contract_id);
+        // Remove the admin from storage to simulate uninitialized state.
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().remove(&DataKey::Admin);
+        });
+        client
+    }
+
+    // ========== Version Surface Tests ==========
+
+    /// `version()` is the fixed contract identity tag; the version constant is stable
+    /// across the contract's lifetime.
+    #[test]
+    fn test_version_returns_router_v2() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        assert_eq!(client.version(), symbol_short!("ROUTER_V2"));
+    }
+
+    /// `version()` is the fixed contract identity tag and must be entirely
+    /// independent of `get_schema_version()`: migrating the storage schema from v1 to v2
+    /// advances the schema number but never the version tag.
+    #[test]
+    fn test_version_constant_independent_of_schema_migration() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+
+        // Both are at their initial values.
+        assert_eq!(client.version(), symbol_short!("ROUTER_V2"));
+        assert_eq!(client.get_schema_version(), 1u32);
+
+        // Perform schema migration.
+        client.migrate_v1_to_v2();
+
+        // Schema advanced 1 → 2, but version tag remains `ROUTER_V2`.
+        assert_eq!(client.get_schema_version(), 2u32);
+        assert_eq!(client.version(), symbol_short!("ROUTER_V2"));
+    }
+
+    /// `get_schema_version()` returns 1 (the implicit pre-migration default) when no
+    /// schema version has been persisted to storage yet.
+    #[test]
+    fn test_schema_version_defaults_to_one_when_uninitialized() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        assert_eq!(client.get_schema_version(), 1u32);
+    }
+
+    // ========== NotInitialized (#2) Failure Path Tests ==========
+
+    // Every admin-gated entrypoint must panic with `NotInitialized` (#2) when called on a
+    // contract that has not had its admin set. This test group validates the security
+    // invariant: no admin action succeeds before initialization.
+
+    /// `pause()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_pause_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.pause();
+    }
+
+    /// `unpause()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_unpause_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.unpause();
+    }
+
+    /// `register_pair()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_register_pair_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+    }
+
+    /// `register_pairs()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_register_pairs_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.register_pairs(&soroban_sdk::Vec::from_slice(
+            &env,
+            &[(symbol_short!("USDC"), symbol_short!("EURC"))],
+        ));
+    }
+
+    /// `set_pair_fee_bps()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_set_pair_fee_bps_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &50u32);
+    }
+
+    /// `set_pair_fees_bps()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_set_pair_fees_bps_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.set_pair_fees_bps(&soroban_sdk::Vec::from_slice(
+            &env,
+            &[(symbol_short!("USDC"), symbol_short!("EURC"), 50u32)],
+        ));
+    }
+
+    /// `set_pair_min_amount()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_set_pair_min_amount_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.set_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &10i128);
+    }
+
+    /// `set_pair_max_amount()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_set_pair_max_amount_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.set_pair_max_amount(
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &1_000_000i128,
+        );
+    }
+
+    /// `set_pair_liquidity()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_set_pair_liquidity_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        let caller = Address::generate(&env);
+        client.set_pair_liquidity(
+            &caller,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &500i128,
+        );
+    }
+
+    /// `unregister_pair()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_unregister_pair_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.unregister_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+    }
+
+    /// `propose_admin_transfer()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_propose_admin_transfer_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        let new_admin = Address::generate(&env);
+        client.propose_admin_transfer(&new_admin);
+    }
+
+    /// `cancel_admin_transfer()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_cancel_admin_transfer_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.cancel_admin_transfer();
+    }
+
+    /// `set_fee_recipient()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_set_fee_recipient_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        let recipient = Address::generate(&env);
+        client.set_fee_recipient(&recipient);
+    }
+
+    /// `set_timelock()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_set_timelock_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.set_timelock(&100u64);
+    }
+
+    /// `set_pair_cooldown()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_set_pair_cooldown_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.set_pair_cooldown(&symbol_short!("USDC"), &symbol_short!("EURC"), &60u64);
+    }
+
+    /// `set_oracle()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_set_oracle_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        let oracle = Address::generate(&env);
+        client.set_oracle(&oracle);
+    }
+
+    /// `set_max_fee_absolute()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_set_max_fee_absolute_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.set_max_fee_absolute(&1_000i128);
+    }
+
+    /// `migrate_v1_to_v2()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_migrate_v1_to_v2_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        client.migrate_v1_to_v2();
+    }
+
+    /// `upgrade()` panics with `NotInitialized` (#2) when called on an uninitialized contract.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_upgrade_panics_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+        let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
+        client.upgrade(&dummy_hash);
+    }
+
+    // ========== Security Invariant Validation ==========
+
+    /// All read-only entrypoints (version, schema_version, pair queries) succeed on
+    /// uninitialized contracts (no admin required for reads).
+    #[test]
+    fn test_read_only_operations_work_on_uninitialized_contract() {
+        let env = Env::default();
+        let client = setup_uninitialized(&env);
+
+        // These all succeed because they are read-only (no admin check).
+        assert_eq!(client.version(), symbol_short!("ROUTER_V2"));
+        assert_eq!(client.get_schema_version(), 1u32);
+        assert!(!client.is_paused());
+        assert_eq!(client.get_admin(), None);
+        assert_eq!(client.get_pending_admin(), None);
+        assert_eq!(client.get_timelock(), 0u64);
+        assert_eq!(client.get_pending_admin_eta(), None);
+        assert_eq!(client.get_fee_recipient(), None);
+        assert_eq!(client.get_oracle(), None);
+        assert_eq!(client.get_max_fee_absolute(), None);
+        assert!(!client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+        assert_eq!(
+            client.get_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            0u32
+        );
+        assert_eq!(
+            client.get_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            0i128
+        );
+        assert_eq!(
+            client.get_pair_max_amount(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            i128::MAX
+        );
+        assert_eq!(
+            client.get_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            0i128
+        );
+    }
+
+    /// Version and schema version are separate concepts: `version()` is stable,
+    /// while `get_schema_version()` evolves with migrations. On an initialized but
+    /// unmigrated contract, both are at their initial values.
+    #[test]
+    fn test_version_and_schema_version_are_separate_concepts() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+
+        // Version is a constant, schema_version is a persistent value.
+        let version = client.version();
+        let schema = client.get_schema_version();
+
+        assert_eq!(version, symbol_short!("ROUTER_V2"));
+        assert_eq!(schema, 1u32);
+        // These are distinct types and values - Symbol vs u32.
+    }
+
+    /// After initialization, admin-gated operations become available (they do not panic
+    /// with NotInitialized). This test verifies the initialization unlocks admin gates.
+    #[test]
+    fn test_admin_operations_succeed_after_initialization() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+
+        // These now succeed because initialization has set the admin.
+        client.pause();
+        assert!(client.is_paused());
+        client.unpause();
+        assert!(!client.is_paused());
+    }
+}
