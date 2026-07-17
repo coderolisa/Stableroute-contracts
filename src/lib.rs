@@ -4096,6 +4096,83 @@ mod test_i19_authorization {
         client.migrate_v1_to_v2();
     }
 
+    #[test]
+    #[should_panic]
+    fn test_set_max_fee_absolute_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.set_max_fee_absolute(&1000i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_pair_cooldown_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.set_pair_cooldown(&symbol_short!("USDC"), &symbol_short!("EURC"), &100u64);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_oracle_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.set_oracle(&Address::generate(&env));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_timelock_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.set_timelock(&100u64);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_cancel_admin_transfer_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.cancel_admin_transfer();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_force_admin_transfer_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.force_admin_transfer(&Address::generate(&env));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_upgrade_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        client.upgrade(&BytesN::from_array(&env, [0; 32]));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_register_pairs_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        let pairs = Vec::from_slice(&env, &[(symbol_short!("USDC"), symbol_short!("EURC"))]);
+        client.register_pairs(&pairs);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_pair_fees_bps_requires_admin() {
+        let env = Env::default();
+        let client = setup_scoped(&env);
+        let entries = Vec::from_slice(
+            &env,
+            &[(symbol_short!("USDC"), symbol_short!("EURC"), 100u32)],
+        );
+        client.set_pair_fees_bps(&entries);
+    }
+
     /// Positive control: with the admin's auth supplied, the call succeeds.
     #[test]
     fn test_admin_can_register_with_auth() {

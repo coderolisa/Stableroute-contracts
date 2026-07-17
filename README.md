@@ -187,22 +187,8 @@ tiers) and the PR checklist.
 
 ## Testing notes
 
-### Constructor / legacy `init` matrix
-
-Constructor coverage now treats deployment as a security boundary, not just a
-storage write:
-
-- A fresh `env.register(StableRouteRouter, (admin,))` test asserts
-  `env.events().all()` contains exactly one event, with the single topic
-  `init` and the constructor admin as the payload.
-- The same deploy-only path asserts `get_admin()` returns the constructor's
-  admin immediately, with no follow-up `init` call.
-- Post-deploy `init(addr)` is pinned to fail with `AlreadyInitialized` (#1)
-  for both the original admin and any different address.
-
-Security assumption covered by this matrix: router deployment is observable to
-indexers through the emitted `init` event, while legacy `init` can never be
-used to re-seize or rotate admin after deployment.
+### Authorization testing
+All admin-gated entrypoints have negative-authorization tests in `test_i19_authorization` (asserting non-admins are rejected) and positive controls (asserting admins can invoke them). When adding a new admin-gated entrypoint, add a corresponding `test_*_requires_admin` case to this module.
 
 ## Liquidity consumption model
 
