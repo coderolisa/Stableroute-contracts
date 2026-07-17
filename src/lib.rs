@@ -106,6 +106,15 @@ pub const BPS_DENOMINATOR: i128 = 10_000;
 /// (`register_pairs`, `set_pair_fees_bps`). Kept modest to bound
 /// per-transaction gas costs.
 pub const MAX_BATCH_SIZE: u32 = 100;
+/// Upper bound on the per-pair route cooldown, in seconds (30 days).
+/// `set_pair_cooldown` rejects any larger value so a fat-fingered or
+/// malicious config write (e.g. `u64::MAX`) cannot permanently brick a
+/// corridor by making `compute_route_fee`'s `last + cooldown` gate
+/// unreachable. Ledger timestamps are seconds since epoch and are nowhere
+/// near `u64::MAX - MAX_COOLDOWN_SECS`, so capping here also guarantees
+/// the `last + cooldown` addition in `compute_route_fee` cannot overflow
+/// `u64` for the foreseeable future.
+pub const MAX_COOLDOWN_SECS: u64 = 2_592_000;
 
 /// Typed contract errors. Codes are append-only — never reuse or
 /// renumber a variant once it has shipped.
@@ -157,6 +166,9 @@ pub enum RouterError {
     BatchTooLarge = 18,
     /// A batch entrypoint was called with no entries.
     EmptyBatch = 19,
+    /// `set_pair_cooldown` was called with a value above
+    /// [`MAX_COOLDOWN_SECS`].
+    CooldownTooLarge = 20,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -467,7 +479,7 @@ impl StableRouteRouter {
             panic_with_error!(&env, RouterError::ContractPaused);
         }
         Self::require_admin(&env);
-        if pairs.len() == 0 {
+        if pairs.is_empty() {
             panic_with_error!(&env, RouterError::EmptyBatch);
         }
         if pairs.len() > MAX_BATCH_SIZE {
@@ -572,8 +584,14 @@ impl StableRouteRouter {
     /// for the pair until at least `cooldown_secs` seconds have elapsed
     /// since the pair's last successful route (`PairLastRouteAt`).
     /// Setting `0` (the default) disables the rate limit for the pair.
+    /// Rejects values above [`MAX_COOLDOWN_SECS`] with
+    /// [`RouterError::CooldownTooLarge`] so an absurdly large value
+    /// (e.g. `u64::MAX`) cannot permanently brick the corridor.
     pub fn set_pair_cooldown(env: Env, source: Symbol, destination: Symbol, cooldown_secs: u64) {
         Self::require_admin(&env);
+        if cooldown_secs > MAX_COOLDOWN_SECS {
+            panic_with_error!(&env, RouterError::CooldownTooLarge);
+        }
         env.storage().persistent().set(
             &DataKey::PairCooldown(source.clone(), destination.clone()),
             &cooldown_secs,
@@ -879,7 +897,7 @@ impl StableRouteRouter {
             panic_with_error!(&env, RouterError::ContractPaused);
         }
         Self::require_admin(&env);
-        if entries.len() == 0 {
+        if entries.is_empty() {
             panic_with_error!(&env, RouterError::EmptyBatch);
         }
         if entries.len() > MAX_BATCH_SIZE {
@@ -994,7 +1012,12 @@ impl StableRouteRouter {
         // recorded timestamp) is always allowed; cooldown == 0 disables
         // the check entirely, preserving the prior behaviour. Compare via
         // addition (last + cooldown) rather than subtraction to avoid any
-        // u64 underflow.
+        // u64 underflow. `last + cooldown` cannot overflow u64 either:
+        // `set_pair_cooldown` rejects any `cooldown` above
+        // `MAX_COOLDOWN_SECS` (30 days), and `last` is a ledger timestamp
+        // (seconds since epoch) that would need to be within 30 days of
+        // `u64::MAX` — many orders of magnitude beyond any plausible
+        // ledger closing time — before this addition could wrap.
         let cooldown: u64 = env
             .storage()
             .persistent()
@@ -2556,6 +2579,88 @@ mod test {
     }
 
     #[test]
+    fn test_set_pair_cooldown_accepts_max_cooldown() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let s = symbol_short!("USDC");
+        let d = symbol_short!("EURC");
+        client.register_pair(&s, &d);
+        client.set_pair_cooldown(&s, &d, &MAX_COOLDOWN_SECS);
+        assert_eq!(client.get_pair_cooldown(&s, &d), MAX_COOLDOWN_SECS);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #20)")]
+    fn test_set_pair_cooldown_rejects_above_max() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let s = symbol_short!("USDC");
+        let d = symbol_short!("EURC");
+        client.register_pair(&s, &d);
+        client.set_pair_cooldown(&s, &d, &(MAX_COOLDOWN_SECS + 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #20)")]
+    fn test_set_pair_cooldown_rejects_u64_max() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let s = symbol_short!("USDC");
+        let d = symbol_short!("EURC");
+        client.register_pair(&s, &d);
+        client.set_pair_cooldown(&s, &d, &u64::MAX);
+    }
+
+    #[test]
+    fn test_set_pair_cooldown_zero_disables_rate_limit() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
+        // 0 is the default, but set it explicitly to exercise the write
+        // path and confirm it still round-trips and disables the gate.
+        client.set_pair_cooldown(&s, &d, &0u64);
+        assert_eq!(client.get_pair_cooldown(&s, &d), 0);
+
+        env.ledger().set_timestamp(1_000);
+        client.compute_route_fee(&s, &d, &100i128);
+        // Back-to-back routes at the same timestamp are allowed because
+        // the cooldown is disabled.
+        client.compute_route_fee(&s, &d, &100i128);
+        assert_eq!(client.get_pair_route_count(&s, &d), 2);
+    }
+
+    #[test]
+    fn test_cooldown_boundary_at_max_cooldown_no_overflow() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_liquidity_pair(&env);
+        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
+        client.set_pair_cooldown(&s, &d, &MAX_COOLDOWN_SECS);
+
+        let start: u64 = 1_000;
+        env.ledger().set_timestamp(start);
+        client.compute_route_fee(&s, &d, &100i128);
+        assert_eq!(client.get_pair_last_route_at(&s, &d), Some(start));
+
+        // Exactly at the boundary (last + MAX_COOLDOWN_SECS) the route
+        // must still be rejected (strict `<` comparison), with no
+        // overflow panicking instead of the expected cooldown error.
+        env.ledger().set_timestamp(start + MAX_COOLDOWN_SECS - 1);
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.compute_route_fee(&s, &d, &100i128)
+        }));
+        assert!(err.is_err());
+
+        // One second past the boundary the route is allowed again, and
+        // `last + cooldown` computed without overflow.
+        env.ledger().set_timestamp(start + MAX_COOLDOWN_SECS);
+        client.compute_route_fee(&s, &d, &100i128);
+        assert_eq!(
+            client.get_pair_last_route_at(&s, &d),
+            Some(start + MAX_COOLDOWN_SECS)
+        );
+    }
+
+    #[test]
     fn test_multiple_pairs_independent_liquidity() {
         let env = Env::default();
         let (client, admin) = setup_initialized(&env);
@@ -3100,7 +3205,7 @@ mod test_i18_read_surface {
     #[test]
     fn test_pair_info_reflects_configuration() {
         let env = Env::default();
-        let (client, admin) = setup(&env);
+        let (client, _admin) = setup(&env);
         let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
         client.register_pair(&s, &d);
         client.set_pair_fee_bps(&s, &d, &25u32);
@@ -3119,7 +3224,7 @@ mod test_i18_read_surface {
     #[test]
     fn test_is_pair_active_requires_registration_and_liquidity() {
         let env = Env::default();
-        let (client, admin) = setup(&env);
+        let (client, _admin) = setup(&env);
         let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
         assert!(!client.is_pair_active(&s, &d));
         client.register_pair(&s, &d);

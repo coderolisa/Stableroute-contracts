@@ -86,6 +86,7 @@ in [`src/lib.rs`](src/lib.rs).
 | 17 | `RouteCooldownActive` | `compute_route_fee` | Pair cooldown has not elapsed since the previous routed amount. |
 | 18 | `BatchTooLarge` | `register_pairs`, `set_pair_fees_bps` | Batch length exceeds `MAX_BATCH_SIZE` (100). Split into smaller batches. |
 | 19 | `EmptyBatch` | `register_pairs`, `set_pair_fees_bps` | Batch contains no entries. Provide at least one pair or fee update. |
+| 20 | `CooldownTooLarge` | `set_pair_cooldown` | Cooldown exceeds `MAX_COOLDOWN_SECS` (2,592,000 seconds = 30 days). Use a smaller value. |
 
 > **Maintainers:** when you append a new `RouterError` variant, add a row
 > here with the next sequential code. Never edit an existing code/row.
