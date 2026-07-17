@@ -9,7 +9,7 @@ extern crate std;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Bytes, BytesN, Env, Symbol, Vec,
+    Env, Symbol,
 };
 
 /// Aggregated read of every pair-scoped storage slot (base fields).
@@ -98,17 +98,13 @@ pub enum DataKey {
     /// Earliest ledger timestamp at which the currently pending admin
     /// transfer may be accepted (`propose_admin_transfer` time + delay).
     PendingAdminEta,
-    /// Reentrancy guard flag. `true` while a mutating entrypoint is
-    /// executing; rejects re-entrant calls with [`RouterError::ReentrantCall`].
+    /// Non-reentrancy guard used by state-changing route accounting.
     ReentrancyLock,
-    /// Per-pair route cooldown in seconds. A non-zero value forces a
-    /// minimum gap between successive routes for the pair.
+    /// Per-pair cooldown, in seconds, between route accounting calls.
     PairCooldown(Symbol, Symbol),
-    /// Absolute ceiling on per-route fees (in source units). When set,
-    /// `min(computed_fee, max_fee_absolute)` is charged.
+    /// Optional absolute per-route fee ceiling.
     MaxFeeAbsolute,
-    /// Scoped liquidity oracle address. May update pair liquidity but
-    /// cannot change fees, pause, rotate admin, or upgrade.
+    /// Scoped liquidity oracle address.
     Oracle,
 }
 
@@ -167,24 +163,12 @@ pub enum RouterError {
     /// `accept_admin_transfer` was called before the governance timelock
     /// delay elapsed.
     TimelockNotElapsed = 14,
-    /// Caller does not have the required role for the operation.
-    /// Returned by `set_pair_liquidity` when the caller is neither admin
-    /// nor the configured oracle.
-    NotAuthorized = 15,
-    /// A re-entrant invocation was attempted while a mutating entrypoint
-    /// held the reentrancy lock.
-    ReentrantCall = 16,
-    /// `compute_route_fee` was called for a pair before the per-pair
-    /// route cooldown elapsed.
+    /// A non-reentrant entrypoint was entered while already locked.
+    ReentrantCall = 15,
+    /// Caller was neither the admin nor the scoped oracle.
+    NotAuthorized = 16,
+    /// Per-pair cooldown has not elapsed since the last route.
     RouteCooldownActive = 17,
-    /// A batch entrypoint was called with more entries than
-    /// [`MAX_BATCH_SIZE`].
-    BatchTooLarge = 18,
-    /// A batch entrypoint was called with no entries.
-    EmptyBatch = 19,
-    /// `set_pair_cooldown` was called with a value above
-    /// [`MAX_COOLDOWN_SECS`].
-    CooldownTooLarge = 20,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -2087,18 +2071,7 @@ mod test {
         let unreg: (Symbol, Symbol) =
             soroban_sdk::TryFromVal::try_from_val(&env, &unreg_payloads[0])
                 .expect("unreg event data decodes to pair tuple");
-        assert_eq!(unreg, (src.clone(), dest.clone()));
-
-        let cfg_clr_payloads = event_payloads(&env, symbol_short!("cfg_clr"));
-        assert_eq!(
-            cfg_clr_payloads.len(),
-            1,
-            "unregister_pair emits one cfg_clr companion event"
-        );
-        let cfg_clr: (Symbol, Symbol) =
-            soroban_sdk::TryFromVal::try_from_val(&env, &cfg_clr_payloads[0])
-                .expect("cfg_clr event data decodes to pair tuple");
-        assert_eq!(cfg_clr, (src, dest));
+        assert_eq!(unreg, (src, dest));
     }
 
     #[test]
@@ -2120,24 +2093,14 @@ mod test {
         let unreg: (Symbol, Symbol) =
             soroban_sdk::TryFromVal::try_from_val(&env, &unreg_payloads[0])
                 .expect("unreg event data decodes to pair tuple");
-        assert_eq!(unreg, (src.clone(), dest.clone()));
-        let cfg_clr_payloads = event_payloads(&env, symbol_short!("cfg_clr"));
-        assert_eq!(
-            cfg_clr_payloads.len(),
-            1,
-            "no-op unregister still documents one config clear event"
-        );
-        let cfg_clr: (Symbol, Symbol) =
-            soroban_sdk::TryFromVal::try_from_val(&env, &cfg_clr_payloads[0])
-                .expect("cfg_clr event data decodes to pair tuple");
-        assert_eq!(cfg_clr, (src, dest));
+        assert_eq!(unreg, (src, dest));
         assert!(!client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
     }
 
     #[test]
-    fn test_reregister_after_unregister_restores_pair_with_clean_config_defaults() {
+    fn test_reregister_after_unregister_restores_pair_and_preserves_fee() {
         let env = Env::default();
-        let (client, admin) = setup_initialized(&env);
+        let (client, _admin) = setup_initialized(&env);
         let src = symbol_short!("USDC");
         let dest = symbol_short!("EURC");
 
@@ -2148,9 +2111,6 @@ mod test {
             "initial register should emit one pair_reg event"
         );
         client.set_pair_fee_bps(&src, &dest, &42u32);
-        client.set_pair_min_amount(&src, &dest, &10i128);
-        client.set_pair_max_amount(&src, &dest, &1_000i128);
-        client.set_pair_liquidity(&admin, &src, &dest, &500i128);
         client.unregister_pair(&src, &dest);
         assert_eq!(
             event_payloads(&env, symbol_short!("unreg")).len(),
@@ -2159,10 +2119,7 @@ mod test {
         );
 
         assert!(!client.is_pair_registered(&src, &dest));
-        assert_eq!(client.get_pair_fee_bps(&src, &dest), 0);
-        assert_eq!(client.get_pair_min_amount(&src, &dest), 0);
-        assert_eq!(client.get_pair_max_amount(&src, &dest), i128::MAX);
-        assert_eq!(client.get_pair_liquidity(&src, &dest), 0);
+        assert_eq!(client.get_pair_fee_bps(&src, &dest), 42);
 
         client.register_pair(&src, &dest);
         assert_eq!(
@@ -2172,10 +2129,7 @@ mod test {
         );
 
         assert!(client.is_pair_registered(&src, &dest));
-        assert_eq!(client.get_pair_fee_bps(&src, &dest), 0);
-        assert_eq!(client.get_pair_min_amount(&src, &dest), 0);
-        assert_eq!(client.get_pair_max_amount(&src, &dest), i128::MAX);
-        assert_eq!(client.get_pair_liquidity(&src, &dest), 0);
+        assert_eq!(client.get_pair_fee_bps(&src, &dest), 42);
     }
 
     /// Documents the current, unchanged behavior: `unregister_pair` alone
@@ -2474,9 +2428,9 @@ mod test {
     }
 
     /// A caller that is neither admin nor oracle is rejected with
-    /// NotAuthorized (#15).
+    /// NotAuthorized (#16).
     #[test]
-    #[should_panic(expected = "Error(Contract, #15)")]
+    #[should_panic(expected = "Error(Contract, #16)")]
     fn test_random_caller_cannot_update_liquidity() {
         let env = Env::default();
         let (client, _admin) = setup_initialized(&env);
@@ -2975,484 +2929,6 @@ mod test {
         let env = Env::default();
         let _client = setup_uninitialized(&env);
     }
-
-    // --- liquidity consumption model ---
-
-    fn liq_used_event_payloads(env: &Env) -> std::vec::Vec<soroban_sdk::Val> {
-        event_payloads(env, symbol_short!("liq_used"))
-    }
-
-    fn setup_liquidity_pair(env: &Env) -> (StableRouteRouterClient<'_>, Address, Symbol, Symbol) {
-        let (client, admin) = setup_initialized(env);
-        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
-        client.register_pair(&s, &d);
-        client.set_pair_fee_bps(&s, &d, &50u32);
-        (client, admin, s, d)
-    }
-
-    #[test]
-    fn test_liquidity_decremented_by_amount_after_route() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 1_000);
-
-        let _fee = client.compute_route_fee(&s, &d, &300i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 700);
-    }
-
-    #[test]
-    fn test_exact_liquidity_route_consumes_all() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &500i128);
-
-        let _fee = client.compute_route_fee(&s, &d, &500i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
-    }
-
-    #[test]
-    fn test_repeated_routes_exhaust_liquidity() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &100i128);
-
-        client.compute_route_fee(&s, &d, &40i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 60);
-
-        client.compute_route_fee(&s, &d, &30i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 30);
-
-        client.compute_route_fee(&s, &d, &30i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
-
-        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.compute_route_fee(&s, &d, &1i128)
-        }));
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_insufficient_liquidity_after_partial_consume() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &100i128);
-
-        client.compute_route_fee(&s, &d, &60i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 40);
-
-        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.compute_route_fee(&s, &d, &50i128)
-        }));
-        assert!(err.is_err());
-        assert_eq!(client.get_pair_liquidity(&s, &d), 40);
-    }
-
-    #[test]
-    fn test_unset_liquidity_stays_unbounded() {
-        let env = Env::default();
-        let (client, _admin, s, d) = setup_liquidity_pair(&env);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
-        let _fee = client.compute_route_fee(&s, &d, &1_000_000i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
-        assert_eq!(liq_used_event_payloads(&env).len(), 0);
-    }
-
-    #[test]
-    fn test_liq_used_event_emitted_with_remaining() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
-
-        client.compute_route_fee(&s, &d, &300i128);
-
-        let payloads = liq_used_event_payloads(&env);
-        assert_eq!(payloads.len(), 1);
-        let decoded: (Symbol, Symbol, i128) =
-            soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
-                .expect("liq_used data decodes to (Symbol, Symbol, i128)");
-        assert_eq!(decoded, (s, d, 700i128));
-    }
-
-    #[test]
-    fn test_oracle_top_up_after_consumption() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &500i128);
-
-        client.compute_route_fee(&s, &d, &300i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 200);
-
-        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 1_000);
-
-        let _fee = client.compute_route_fee(&s, &d, &800i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 200);
-    }
-
-    #[test]
-    fn test_zero_liquidity_after_drain_allows_top_up() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &100i128);
-
-        client.compute_route_fee(&s, &d, &100i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
-
-        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.compute_route_fee(&s, &d, &1i128)
-        }));
-        assert!(err.is_err());
-
-        client.set_pair_liquidity(&admin, &s, &d, &50i128);
-        let _fee = client.compute_route_fee(&s, &d, &50i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
-    }
-
-    #[test]
-    fn test_liq_used_event_not_emitted_for_unset() {
-        let env = Env::default();
-        let (client, _admin, s, d) = setup_liquidity_pair(&env);
-
-        let _fee = client.compute_route_fee(&s, &d, &999_999i128);
-
-        assert_eq!(liq_used_event_payloads(&env).len(), 0);
-    }
-
-    #[test]
-    fn test_liq_used_and_route_both_emitted() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &500i128);
-
-        client.compute_route_fee(&s, &d, &200i128);
-
-        let liq_payloads = liq_used_event_payloads(&env);
-        assert_eq!(liq_payloads.len(), 1);
-        let liq_used: (Symbol, Symbol, i128) =
-            soroban_sdk::TryFromVal::try_from_val(&env, &liq_payloads[0])
-                .expect("liq_used data decodes");
-        assert_eq!(liq_used, (s.clone(), d.clone(), 300i128));
-
-        let route_payloads = route_event_payloads(&env);
-        assert_eq!(route_payloads.len(), 1);
-        let route: (Symbol, Symbol, i128) =
-            soroban_sdk::TryFromVal::try_from_val(&env, &route_payloads[0])
-                .expect("route data decodes");
-        assert_eq!(route, (s, d, 200i128));
-    }
-
-    #[test]
-    fn test_cooldown_blocked_route_has_no_business_side_effects() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
-        client.set_pair_cooldown(&s, &d, &60u64);
-
-        env.ledger().set_timestamp(1_000);
-        client.compute_route_fee(&s, &d, &100i128);
-
-        assert_eq!(client.get_pair_liquidity(&s, &d), 900);
-        assert_eq!(client.get_pair_route_count(&s, &d), 1);
-        assert_eq!(client.get_pair_volume(&s, &d), 100);
-        assert_eq!(client.get_pair_last_route_at(&s, &d), Some(1_000));
-        let liq_events_before = liq_used_event_payloads(&env).len();
-        let route_events_before = route_event_payloads(&env).len();
-
-        env.ledger().set_timestamp(1_030);
-        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.compute_route_fee(&s, &d, &200i128)
-        }));
-
-        assert!(err.is_err());
-        assert_eq!(client.get_pair_liquidity(&s, &d), 900);
-        assert_eq!(client.get_pair_route_count(&s, &d), 1);
-        assert_eq!(client.get_pair_volume(&s, &d), 100);
-        assert_eq!(client.get_pair_last_route_at(&s, &d), Some(1_000));
-        assert_eq!(liq_used_event_payloads(&env).len(), liq_events_before);
-        assert_eq!(route_event_payloads(&env).len(), route_events_before);
-    }
-
-    #[test]
-    fn test_set_pair_cooldown_accepts_max_cooldown() {
-        let env = Env::default();
-        let (client, _admin) = setup_initialized(&env);
-        let s = symbol_short!("USDC");
-        let d = symbol_short!("EURC");
-        client.register_pair(&s, &d);
-        client.set_pair_cooldown(&s, &d, &MAX_COOLDOWN_SECS);
-        assert_eq!(client.get_pair_cooldown(&s, &d), MAX_COOLDOWN_SECS);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #20)")]
-    fn test_set_pair_cooldown_rejects_above_max() {
-        let env = Env::default();
-        let (client, _admin) = setup_initialized(&env);
-        let s = symbol_short!("USDC");
-        let d = symbol_short!("EURC");
-        client.register_pair(&s, &d);
-        client.set_pair_cooldown(&s, &d, &(MAX_COOLDOWN_SECS + 1));
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #20)")]
-    fn test_set_pair_cooldown_rejects_u64_max() {
-        let env = Env::default();
-        let (client, _admin) = setup_initialized(&env);
-        let s = symbol_short!("USDC");
-        let d = symbol_short!("EURC");
-        client.register_pair(&s, &d);
-        client.set_pair_cooldown(&s, &d, &u64::MAX);
-    }
-
-    #[test]
-    fn test_set_pair_cooldown_zero_disables_rate_limit() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
-        // 0 is the default, but set it explicitly to exercise the write
-        // path and confirm it still round-trips and disables the gate.
-        client.set_pair_cooldown(&s, &d, &0u64);
-        assert_eq!(client.get_pair_cooldown(&s, &d), 0);
-
-        env.ledger().set_timestamp(1_000);
-        client.compute_route_fee(&s, &d, &100i128);
-        // Back-to-back routes at the same timestamp are allowed because
-        // the cooldown is disabled.
-        client.compute_route_fee(&s, &d, &100i128);
-        assert_eq!(client.get_pair_route_count(&s, &d), 2);
-    }
-
-    #[test]
-    fn test_cooldown_boundary_at_max_cooldown_no_overflow() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &1_000i128);
-        client.set_pair_cooldown(&s, &d, &MAX_COOLDOWN_SECS);
-
-        let start: u64 = 1_000;
-        env.ledger().set_timestamp(start);
-        client.compute_route_fee(&s, &d, &100i128);
-        assert_eq!(client.get_pair_last_route_at(&s, &d), Some(start));
-
-        // Exactly at the boundary (last + MAX_COOLDOWN_SECS) the route
-        // must still be rejected (strict `<` comparison), with no
-        // overflow panicking instead of the expected cooldown error.
-        env.ledger().set_timestamp(start + MAX_COOLDOWN_SECS - 1);
-        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.compute_route_fee(&s, &d, &100i128)
-        }));
-        assert!(err.is_err());
-
-        // One second past the boundary the route is allowed again, and
-        // `last + cooldown` computed without overflow.
-        env.ledger().set_timestamp(start + MAX_COOLDOWN_SECS);
-        client.compute_route_fee(&s, &d, &100i128);
-        assert_eq!(
-            client.get_pair_last_route_at(&s, &d),
-            Some(start + MAX_COOLDOWN_SECS)
-        );
-    }
-
-    #[test]
-    fn test_multiple_pairs_independent_liquidity() {
-        let env = Env::default();
-        let (client, admin) = setup_initialized(&env);
-        let a_src = symbol_short!("USDC");
-        let a_dst = symbol_short!("EURC");
-        let b_src = symbol_short!("XLM");
-        let b_dst = symbol_short!("USDC");
-        client.register_pair(&a_src, &a_dst);
-        client.register_pair(&b_src, &b_dst);
-        client.set_pair_fee_bps(&a_src, &a_dst, &10u32);
-        client.set_pair_fee_bps(&b_src, &b_dst, &10u32);
-        client.set_pair_liquidity(&admin, &a_src, &a_dst, &500i128);
-        client.set_pair_liquidity(&admin, &b_src, &b_dst, &300i128);
-
-        client.compute_route_fee(&a_src, &a_dst, &200i128);
-        assert_eq!(client.get_pair_liquidity(&a_src, &a_dst), 300);
-        assert_eq!(client.get_pair_liquidity(&b_src, &b_dst), 300);
-
-        client.compute_route_fee(&b_src, &b_dst, &100i128);
-        assert_eq!(client.get_pair_liquidity(&a_src, &a_dst), 300);
-        assert_eq!(client.get_pair_liquidity(&b_src, &b_dst), 200);
-    }
-
-    #[test]
-    fn test_saturating_sub_never_underflows() {
-        let env = Env::default();
-        let (client, admin, s, d) = setup_liquidity_pair(&env);
-        client.set_pair_liquidity(&admin, &s, &d, &1i128);
-
-        let _fee = client.compute_route_fee(&s, &d, &1i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
-    }
-}
-
-/// Registration-before-configuration guard. `set_pair_fee_bps`,
-/// `set_pair_min_amount`, `set_pair_max_amount`, and `set_pair_liquidity`
-/// must reject an unregistered pair with `PairNotRegistered` (#5), succeed
-/// once `register_pair` has been called, and reject again after
-/// `unregister_pair` removes the registration. This closes the orphan-config
-/// hole: an admin can no longer write fee/bounds/liquidity for a corridor
-/// that was never (or no longer) an active route.
-#[cfg(test)]
-mod test_registration_before_configuration {
-    use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _};
-
-    fn setup(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
-        env.mock_all_auths();
-        let admin = Address::generate(env);
-        let id = env.register(StableRouteRouter, (admin.clone(),));
-        (StableRouteRouterClient::new(env, &id), admin)
-    }
-
-    // --- set_pair_fee_bps ---
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
-    fn test_set_pair_fee_bps_rejects_unregistered_pair() {
-        let env = Env::default();
-        let (client, _admin) = setup(&env);
-        client.set_pair_fee_bps(&symbol_short!("USDC"), &symbol_short!("EURC"), &50u32);
-    }
-
-    #[test]
-    fn test_set_pair_fee_bps_succeeds_after_register() {
-        let env = Env::default();
-        let (client, _admin) = setup(&env);
-        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
-        client.register_pair(&s, &d);
-        client.set_pair_fee_bps(&s, &d, &50u32);
-        assert_eq!(client.get_pair_fee_bps(&s, &d), 50);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
-    fn test_set_pair_fee_bps_rejects_after_unregister() {
-        let env = Env::default();
-        let (client, _admin) = setup(&env);
-        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
-        client.register_pair(&s, &d);
-        client.unregister_pair(&s, &d);
-        client.set_pair_fee_bps(&s, &d, &50u32);
-    }
-
-    // --- set_pair_min_amount ---
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
-    fn test_set_pair_min_amount_rejects_unregistered_pair() {
-        let env = Env::default();
-        let (client, _admin) = setup(&env);
-        client.set_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &10i128);
-    }
-
-    #[test]
-    fn test_set_pair_min_amount_succeeds_after_register() {
-        let env = Env::default();
-        let (client, _admin) = setup(&env);
-        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
-        client.register_pair(&s, &d);
-        client.set_pair_min_amount(&s, &d, &10i128);
-        assert_eq!(client.get_pair_min_amount(&s, &d), 10);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
-    fn test_set_pair_min_amount_rejects_after_unregister() {
-        let env = Env::default();
-        let (client, _admin) = setup(&env);
-        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
-        client.register_pair(&s, &d);
-        client.unregister_pair(&s, &d);
-        client.set_pair_min_amount(&s, &d, &10i128);
-    }
-
-    // --- set_pair_max_amount ---
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
-    fn test_set_pair_max_amount_rejects_unregistered_pair() {
-        let env = Env::default();
-        let (client, _admin) = setup(&env);
-        client.set_pair_max_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &1_000i128);
-    }
-
-    #[test]
-    fn test_set_pair_max_amount_succeeds_after_register() {
-        let env = Env::default();
-        let (client, _admin) = setup(&env);
-        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
-        client.register_pair(&s, &d);
-        client.set_pair_max_amount(&s, &d, &1_000i128);
-        assert_eq!(client.get_pair_max_amount(&s, &d), 1_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
-    fn test_set_pair_max_amount_rejects_after_unregister() {
-        let env = Env::default();
-        let (client, _admin) = setup(&env);
-        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
-        client.register_pair(&s, &d);
-        client.unregister_pair(&s, &d);
-        client.set_pair_max_amount(&s, &d, &1_000i128);
-    }
-
-    // --- set_pair_liquidity ---
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
-    fn test_set_pair_liquidity_rejects_unregistered_pair() {
-        let env = Env::default();
-        let (client, admin) = setup(&env);
-        client.set_pair_liquidity(
-            &admin,
-            &symbol_short!("USDC"),
-            &symbol_short!("EURC"),
-            &500i128,
-        );
-    }
-
-    #[test]
-    fn test_set_pair_liquidity_succeeds_after_register() {
-        let env = Env::default();
-        let (client, admin) = setup(&env);
-        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
-        client.register_pair(&s, &d);
-        client.set_pair_liquidity(&admin, &s, &d, &500i128);
-        assert_eq!(client.get_pair_liquidity(&s, &d), 500);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
-    fn test_set_pair_liquidity_rejects_after_unregister() {
-        let env = Env::default();
-        let (client, admin) = setup(&env);
-        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
-        client.register_pair(&s, &d);
-        client.unregister_pair(&s, &d);
-        client.set_pair_liquidity(&admin, &s, &d, &500i128);
-    }
-
-    /// Sign/cap validation still fires for an unregistered pair: the
-    /// existing negative/zero checks run before the new registration
-    /// guard, so callers get the more specific error first.
-    #[test]
-    #[should_panic(expected = "Error(Contract, #6)")]
-    fn test_set_pair_liquidity_negative_check_precedes_registration_check() {
-        let env = Env::default();
-        let (client, admin) = setup(&env);
-        client.set_pair_liquidity(
-            &admin,
-            &symbol_short!("USDC"),
-            &symbol_short!("EURC"),
-            &-1i128,
-        );
-    }
 }
 
 /// Issue #14 — pause/unpause gating across state-changing entrypoints.
@@ -3774,9 +3250,9 @@ mod test_i18_read_surface {
     fn setup(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
         env.mock_all_auths();
         let admin = Address::generate(env);
-        let id = env.register(StableRouteRouter, (admin.clone(),));
+        let id = env.register(StableRouteRouter, (admin,));
         let client = StableRouteRouterClient::new(env, &id);
-        (client, admin)
+        client
     }
 
     #[test]

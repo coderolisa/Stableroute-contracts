@@ -80,13 +80,10 @@ in [`src/lib.rs`](src/lib.rs).
 | 11 | `AmountAboveMax` | `compute_route_fee` | Amount is above the pair's configured maximum. |
 | 12 | `InsufficientLiquidity` | `compute_route_fee` | Reported pair liquidity is below the requested amount. |
 | 13 | `MigrationVersionMismatch` | `migrate_v1_to_v2` | Schema is not at v1; migration already applied. |
-| 14 | `TimelockNotElapsed` | `accept_admin_transfer`, `force_admin_transfer` | Governance timelock has not elapsed yet; retry after the queued ETA. |
-| 15 | `NotAuthorized` | `set_pair_liquidity` | Caller is neither the admin nor the configured oracle. |
-| 16 | `ReentrantCall` | `compute_route_fee` | Route accounting was re-entered while locked; retry only after the first call completes. |
+| 14 | `TimelockNotElapsed` | `accept_admin_transfer` | Governance timelock has not elapsed yet; retry after the queued ETA. |
+| 15 | `ReentrantCall` | `compute_route_fee` | Route accounting was re-entered while locked; retry only after the first call completes. |
+| 16 | `NotAuthorized` | `set_pair_liquidity` | Caller is neither the admin nor the configured oracle. |
 | 17 | `RouteCooldownActive` | `compute_route_fee` | Pair cooldown has not elapsed since the previous routed amount. |
-| 18 | `BatchTooLarge` | `register_pairs`, `set_pair_fees_bps` | Batch length exceeds `MAX_BATCH_SIZE` (100). Split into smaller batches. |
-| 19 | `EmptyBatch` | `register_pairs`, `set_pair_fees_bps` | Batch contains no entries. Provide at least one pair or fee update. |
-| 20 | `CooldownTooLarge` | `set_pair_cooldown` | Cooldown exceeds `MAX_COOLDOWN_SECS` (2,592,000 seconds = 30 days). Use a smaller value. |
 
 > **Maintainers:** when you append a new `RouterError` variant, add a row
 > here with the next sequential code. Never edit an existing code/row.
@@ -253,116 +250,15 @@ buffer:
 |------------|-------|--------------|------|
 | constructor | `init` | `admin` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `register_pair` | `pair_reg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
-| `register_pairs` | `pair_reg` (per entry) | `(source, destination)` (per entry) | `test_register_pairs_happy_path` |
 | `set_pair_fee_bps` | `fee_set` | `(source, destination, fee_bps)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
-| `set_pair_fees_bps` | `fee_set` (per entry) | `(source, destination, fee_bps)` (per entry) | `test_set_pair_fees_bps_happy_path` |
 | `set_pair_liquidity` | `liq_set` | `(source, destination, liquidity)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `set_pair_cooldown` | `cd_set` | `(source, destination, cooldown_secs)` | |
 | `unregister_pair` | `unreg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
-| `unregister_pair` | `cfg_clr` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
-| `compute_route_fee` | `liq_used` | `(source, destination, remaining_liquidity)` | `test_liq_used_event_emitted_with_remaining` |
-| `purge_pair_metrics` | `pair_mrst` | `(source, destination)` | `test_purge_pair_metrics_resets_counters_and_emits_event` |
 
 Two edge-case tests guard idempotency and storage boundaries: unregistering a
 never-registered pair stays a clean no-op while still emitting the lifecycle
-and config-clear events, and re-registering after unregister restores the pair
-with fee, bounds, and liquidity reset to their documented defaults.
-
-## Per-pair route cooldown rate limit
-
-The router supports an optional per-pair cooldown to enforce a minimum interval between routes for a given `(source, destination)` pair. This mitigates spam routing, oracle front-running, and griefing of the route counter.
-
-### How it works
-
-- `set_pair_cooldown(source, destination, cooldown_secs)` (admin-gated) sets the cooldown for a pair (0 = disabled).
-- `get_pair_cooldown(source, destination)` reads the current cooldown (0 by default).
-- On the first route for a pair, no cooldown is applied.
-- On subsequent routes, if the cooldown is non-zero, the router checks if the current ledger timestamp is at least `PairLastRouteAt + cooldown_secs`. If not, it rejects with `RouteCooldownActive` (#17).
-
-### Security assumptions
-
-- Cooldown uses addition (`last + cooldown`) instead of subtraction to avoid underflow.
-- Disabled cooldown (0) preserves backwards compatibility.
-- First route is always allowed.
-
-## Admin transfer flow
-
-The router supports two admin handover paths:
-
-1. **Two-step (default):** `propose_admin_transfer` → `accept_admin_transfer` —
-   requires the new admin to call `accept_admin_transfer` to complete the
-   handover. This prevents accidentally locking the contract with a key that
-   cannot sign.
-2. **Force (timelocked):** `propose_admin_transfer` → `force_admin_transfer` —
-   allows the current admin to complete the handover after the governance
-   timelock has elapsed, without requiring the new admin to sign. This is a
-   recovery path for cases where the new admin key is lost or cannot sign
-   (e.g., a multisig that requires multiple signatures to call `accept_admin_transfer`).
-
-### Force transfer constraints
-
-- `force_admin_transfer` is **admin-gated** (requires the current admin's signature).
-- It **requires a prior `propose_admin_transfer`** for the same `new_admin`.
-- It **honors the governance timelock**: the timelock delay must have elapsed
-  since `propose_admin_transfer` was called (checked via `PendingAdminEta`).
-- It emits the same `executed` event as `accept_admin_transfer`, so indexers
-  treat both paths identically.
-
-### Security trade-off
-
-The force path removes the new admin's "accept" check but preserves the
-timelock as a safety mechanism. The governance timelock ensures watchers have
-time to react to a pending transfer before it can complete, even via the force
-path.
-
-## Upgrades
-
-The router supports in-place WASM upgrades via the admin-gated `upgrade` entrypoint,
-so bug fixes can be deployed without losing pair state, admin configuration, or
-route history.
-
-**Flow:**
-
-1. Build the new WASM artifact:
-   ```bash
-   cargo build --target wasm32-unknown-unknown --release
-   ```
-2. Install the WASM on-chain and obtain its hash:
-   ```bash
-   soroban lab build \
-     --copy-to target/wasm32-unknown-unknown/release/stableroute_contracts.wasm
-
-   soroban contract install \
-     --source <admin-key> \
-     --network <network> \
-     --wasm target/wasm32-unknown-unknown/release/stableroute_contracts.wasm
-   ```
-   The command prints a `BytesN<32>` WASM hash (e.g. `cafebabe...`).
-
-3. Call the `upgrade` entrypoint as the admin:
-   ```bash
-   soroban contract invoke \
-     --source <admin-key> \
-     --network <network> \
-     --id <contract-id> \
-     -- \
-     upgrade \
-     --new_wasm_hash cafebabe...
-   ```
-
-**Security notes:**
-
-- Only the admin (`DataKey::Admin`) can call `upgrade`; the entrypoint uses
-  `require_admin` and will panic with `NotInitialized` (#2) if the contract
-  has not been initialised.
-- The call emits an `upgraded` event carrying the new WASM hash, providing a
-  censorable audit trail for indexers and off-chain watchers.
-- Storage (`DataKey` slots) is preserved across the upgrade — the admin, all
-  registered pairs, fees, liquidity reports, route counters, and configuration
-  survive the WASM replacement.
-- `upgrade` is intentionally **not** paused-gated: the admin should be able to
-  fix a bug even while the contract is emergency-stopped. The admin can always
-  unpause, so there is no escalation path through this exception.
+event, and re-registering after unregister restores the pair without clearing
+the stored `PairFeeBps` value.
 
 ## License
 
