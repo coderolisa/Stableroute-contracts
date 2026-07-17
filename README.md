@@ -114,25 +114,48 @@ would otherwise waste storage rent and pollute future pair enumeration.
 the documented defaults instead of reviving stale fee, bounds, or liquidity
 values.
 
-### Per-pair metric lifecycle: preserved by default, explicitly reset on demand
+## Roles & least privilege
 
-`PairRouteCount`, `PairVolume`, and `PairLastRouteAt` are operational-history
-slots tracked separately from live pair configuration. `unregister_pair`
-**deliberately does not touch them** — a pair's lifetime route count,
-cumulative volume, and last-route timestamp survive an unregister/register
-cycle by default. This is existing, unchanged behaviour: unregistering and
-re-registering the same corridor keeps its history intact unless you opt
-into a reset.
+The router separates governance from the high-frequency liquidity feed:
 
-When a re-listed pair should start a fresh operational life instead of
-inheriting stale metrics from its previous listing, call the admin-gated
-`purge_pair_metrics(source, destination)`. It removes `PairRouteCount`,
-`PairVolume`, and `PairLastRouteAt` for the pair and emits a `pair_mrst`
-event with `(source, destination)`. It does not touch pair registration or
-config (fee/bounds/liquidity) — call `unregister_pair`/`clear_pair_config`
-separately for that. `purge_pair_metrics` can be called before or after an
-unregister/register cycle, or at any time an admin wants to zero a pair's
-history.
+- **Admin** (`DataKey::Admin`) — the single governance role. Required by
+  every state-changing entrypoint, including `set_oracle` and
+  `remove_oracle`.
+- **Oracle** (`DataKey::Oracle`) — an optional, scoped role. The oracle
+  may call `set_pair_liquidity` and **nothing else** — it cannot set
+  fees, pause, rotate admin, or upgrade. This lets a frequently rotated
+  off-chain key keep the liquidity feed fresh without holding governance
+  power.
+
+### Oracle lifecycle
+
+| Action | Entrypoint | Auth | Event |
+|--------|-----------|------|-------|
+| Grant / rotate | `set_oracle(oracle)` | admin | `orac_set` |
+| Revoke | `remove_oracle()` | admin | `orac_rm` |
+| Inspect | `get_oracle()` | none (read) | — |
+
+### Oracle revocation
+
+`remove_oracle` clears `DataKey::Oracle` entirely. This is the recovery
+path for a **compromised oracle key**: rotation via `set_oracle` always
+leaves *some* oracle authorized, whereas removal returns the contract to
+an **admin-only** liquidity feed.
+
+- After removal, `set_pair_liquidity` accepts only the admin again. No
+  special-case code is needed: the dual-auth check
+  (`caller != admin && Some(caller) != oracle`) naturally degrades to
+  admin-only when the slot is absent, because `Some(caller)` can never
+  equal `None`. A revoked oracle is rejected with `NotAuthorized` (#15),
+  the same code any other unauthorized caller receives.
+- Removal is **idempotent** — calling `remove_oracle` when no oracle is
+  configured is a clean no-op.
+- Every call emits an `orac_rm` event carrying the previously configured
+  oracle (`None` on a no-op) so indexers can audit revocations.
+- The missing-admin path reuses `NotInitialized` (#2), like every other
+  admin-gated entrypoint; no new error code was added.
+- The admin can later grant the role to a fresh key with `set_oracle`
+  once the incident is resolved.
 
 ## CI/CD
 

@@ -780,12 +780,38 @@ impl StableRouteRouter {
         env.events().publish((symbol_short!("orac_set"),), oracle);
     }
 
+    /// Admin revokes the scoped liquidity oracle.
+    ///
+    /// Admin-gated (panics with [`RouterError::NotInitialized`] (#2) when
+    /// no admin is set, like every other admin entrypoint). Removes
+    /// `DataKey::Oracle` so [`Self::set_pair_liquidity`] once again
+    /// accepts **only the admin**: its dual-auth check
+    /// (`caller != admin && Some(caller) != oracle`) naturally degrades to
+    /// admin-only when the slot is absent, because `Some(caller)` can
+    /// never equal `None`. This is the recovery path for a compromised
+    /// oracle key — unlike [`Self::set_oracle`] (which can only rotate to
+    /// a new address, leaving *some* oracle authorized), `remove_oracle`
+    /// returns the contract to an admin-only liquidity feed.
+    ///
+    /// Idempotent: removing when no oracle is configured is a clean
+    /// no-op. Emits `orac_rm` carrying the previously configured oracle
+    /// (`None` on a no-op) so indexers can audit revocations.
+    pub fn remove_oracle(env: Env) {
+        Self::require_admin(&env);
+        let removed: Option<Address> = env.storage().persistent().get(&DataKey::Oracle);
+        env.storage().persistent().remove(&DataKey::Oracle);
+        env.events().publish((symbol_short!("orac_rm"),), removed);
+    }
+
     /// Set the reported liquidity for a pair (source units).
     ///
     /// Dual-authorized: `caller` must be **either** the admin **or** the
     /// configured oracle, and must `require_auth()`. This implements
     /// least privilege — the frequently rotated oracle key can keep the
-    /// liquidity feed fresh without holding governance power. Any other
+    /// liquidity feed fresh without holding governance power. When no
+    /// oracle is configured (never set, or revoked via
+    /// [`Self::remove_oracle`]) the `Some(caller) != oracle` comparison is
+    /// always true, so only the admin is accepted. Any other
     /// caller is rejected with [`RouterError::NotAuthorized`].
     ///
     /// Requires the pair to already be registered via
@@ -2368,6 +2394,203 @@ mod test {
             },
         }]);
         client.pause();
+    }
+
+    // --- oracle revocation (remove_oracle) ---
+
+    /// End-to-end revocation flow: the oracle can update liquidity while
+    /// configured, and is fully locked out after `remove_oracle`.
+    #[test]
+    fn test_oracle_can_update_before_removal_but_not_after() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let oracle = Address::generate(&env);
+        client.set_oracle(&oracle);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+
+        // Before removal the oracle drives the liquidity feed.
+        client.set_pair_liquidity(
+            &oracle,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &500i128,
+        );
+        assert_eq!(
+            client.get_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            500
+        );
+
+        client.remove_oracle();
+        assert_eq!(client.get_oracle(), None);
+
+        // After removal the same key is rejected with NotAuthorized (#15).
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_pair_liquidity(
+                &oracle,
+                &symbol_short!("USDC"),
+                &symbol_short!("EURC"),
+                &999i128,
+            )
+        }));
+        assert!(err.is_err());
+        // The blocked call left the last accepted value untouched.
+        assert_eq!(
+            client.get_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            500
+        );
+    }
+
+    /// A revoked oracle is rejected with exactly NotAuthorized (#15) —
+    /// the same code any other stranger gets.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #15)")]
+    fn test_removed_oracle_rejected_with_not_authorized() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let oracle = Address::generate(&env);
+        client.set_oracle(&oracle);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.remove_oracle();
+        client.set_pair_liquidity(
+            &oracle,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &1i128,
+        );
+    }
+
+    /// The admin keeps the liquidity feed after the oracle is revoked:
+    /// the dual-auth check degrades to admin-only when the slot is absent.
+    #[test]
+    fn test_admin_can_still_update_liquidity_after_removal() {
+        let env = Env::default();
+        let (client, admin) = setup_initialized(&env);
+        let oracle = Address::generate(&env);
+        client.set_oracle(&oracle);
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.remove_oracle();
+        client.set_pair_liquidity(
+            &admin,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &42i128,
+        );
+        assert_eq!(
+            client.get_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            42
+        );
+    }
+
+    /// Removal is idempotent: removing when a previous removal (or nothing)
+    /// left the slot empty is a clean no-op and the getter stays None.
+    #[test]
+    fn test_remove_oracle_is_idempotent() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        // Remove when never set — clean no-op.
+        assert_eq!(client.get_oracle(), None);
+        client.remove_oracle();
+        assert_eq!(client.get_oracle(), None);
+        // Set, remove, then remove again — second removal is also a no-op.
+        let oracle = Address::generate(&env);
+        client.set_oracle(&oracle);
+        client.remove_oracle();
+        client.remove_oracle();
+        assert_eq!(client.get_oracle(), None);
+    }
+
+    /// `remove_oracle` emits one `orac_rm` event per call, carrying the
+    /// previously configured oracle (`None` on a no-op removal).
+    #[test]
+    fn test_remove_oracle_emits_orac_rm_event() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let oracle = Address::generate(&env);
+        client.set_oracle(&oracle);
+        client.remove_oracle();
+        let payloads = event_payloads(&env, symbol_short!("orac_rm"));
+        assert_eq!(payloads.len(), 1, "remove_oracle emits one orac_rm event");
+        let removed: Option<Address> = soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+            .expect("orac_rm event data decodes to Option<Address>");
+        assert_eq!(removed, Some(oracle));
+    }
+
+    /// A no-op removal still emits `orac_rm`, with `None` as the payload,
+    /// so indexers observe every revocation attempt.
+    #[test]
+    fn test_remove_oracle_noop_emits_event_with_none() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.remove_oracle();
+        let payloads = event_payloads(&env, symbol_short!("orac_rm"));
+        assert_eq!(payloads.len(), 1);
+        let removed: Option<Address> = soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+            .expect("orac_rm event data decodes to Option<Address>");
+        assert_eq!(removed, None);
+    }
+
+    /// After removal the oracle can be set again (rotation to a fresh key
+    /// once the incident is resolved).
+    #[test]
+    fn test_oracle_can_be_reconfigured_after_removal() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let compromised = Address::generate(&env);
+        client.set_oracle(&compromised);
+        client.remove_oracle();
+        let fresh = Address::generate(&env);
+        client.set_oracle(&fresh);
+        assert_eq!(client.get_oracle(), Some(fresh.clone()));
+        client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
+        client.set_pair_liquidity(
+            &fresh,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &7i128,
+        );
+        assert_eq!(
+            client.get_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            7
+        );
+    }
+
+    /// `remove_oracle` is admin-gated: a caller without the admin's auth
+    /// is rejected, so a compromised oracle cannot un-revoke itself or
+    /// grief the admin by clearing the slot.
+    #[test]
+    #[should_panic]
+    fn test_remove_oracle_requires_admin_auth() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        env.mock_all_auths();
+        let contract_id = env.register(StableRouteRouter, (admin.clone(),));
+        let client = StableRouteRouterClient::new(&env, &contract_id);
+        client.set_oracle(&oracle);
+        // Authorize only the oracle so admin.require_auth() must fail.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &oracle,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "remove_oracle",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.remove_oracle();
+    }
+
+    /// Missing-admin path reuses NotInitialized (#2), like every other
+    /// admin-gated entrypoint.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_remove_oracle_panics_when_uninitialized() {
+        let env = Env::default();
+        let (client, _admin, contract_id) = setup_initialized_with_id(&env);
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().remove(&DataKey::Admin);
+        });
+        client.remove_oracle();
     }
 
     #[test]
